@@ -390,6 +390,7 @@ fn download_worker(
         "4M".into(),
         "--user-agent".into(),
         "Mozilla/5.0".into(),
+        "--newline".into(),
         sanitized_link.clone(),
     ];
 
