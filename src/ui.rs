@@ -1,8 +1,8 @@
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Style},
-    text::Line,
-    widgets::{Block, Borders, LineGauge, Paragraph, Tabs, Wrap, Scrollbar, ScrollbarState},
+    text::{Line, Span},
+    widgets::{Block, Borders, Gauge, Paragraph, Tabs, Wrap, Scrollbar, ScrollbarState},
     Frame,
 };
 
@@ -49,47 +49,14 @@ pub fn render(
     let inner = block.inner(centered[0]);
     frame.render_widget(block, centered[0]);
 
-    let mut status_lines: Vec<(String, Color)> = Vec::new();
-    match (download_status, has_valid_link) {
-        (DownloadStatus::Idle, true) => {
-            status_lines.push((format!("ready: yt-dlp -> {}", output_target), Color::Gray))
-        }
-        (DownloadStatus::Running, true) => status_lines.push((
-            format!("downloader: yt-dlp running -> {output_target}"),
-            Color::Cyan,
-        )),
-        (DownloadStatus::Success, true) => status_lines.push((
-            format!("download complete -> {output_target}"),
-            Color::LightGreen,
-        )),
-        (DownloadStatus::Failed, true) => status_lines.push((
-            format!(
-                "download failed -> {}: {}",
-                output_target,
-                download_error.unwrap_or("unknown error")
-            ),
-            Color::Red,
-        )),
-        _ => {}
-    }
-
-    if matches!(download_status, DownloadStatus::Running) {
-        if let Some(eta) = eta_text {
-            status_lines.push((
-                format!("progress: {:.1}% ETA {eta}", progress * 100.0),
-                Color::Cyan,
-            ));
-        } else {
-            status_lines.push((format!("progress: {:.1}%", progress * 100.0), Color::Cyan));
-        }
-    }
+    let status_lines: Vec<(String, Color)> = Vec::new();
 
     let status_height = status_lines.len().max(1) as u16;
     let constraints: Vec<Constraint> = if has_valid_link {
         vec![
             Constraint::Length(glyph_height as u16),
             Constraint::Length(status_height),
-            Constraint::Length(3),
+            Constraint::Length(6),
             Constraint::Min(glyph_height as u16),
             Constraint::Length(1), // footer
         ]
@@ -127,9 +94,9 @@ pub fn render(
         let gauge_rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
+                Constraint::Length(2),
+                Constraint::Length(2),
+                Constraint::Length(2),
             ])
             .split(gauge_area);
 
@@ -139,11 +106,14 @@ pub fn render(
         } else {
             format!("dl: {:.0}%", (progress * 100.0).min(100.0))
         };
-        let dl_gauge = LineGauge::default()
-            .label(dl_label)
+        let dl_gauge = Gauge::default()
             .gauge_style(Style::default().fg(Color::LightGreen))
+            .use_unicode(true)
             .ratio(progress.min(1.0));
         frame.render_widget(dl_gauge, gauge_rows[0]);
+        let dl_line = colored_gauge_label(&dl_label, gauge_rows[0].width, progress);
+        let dl_para = Paragraph::new(dl_line).alignment(Alignment::Center);
+        frame.render_widget(dl_para, gauge_rows[0]);
 
         // Split gauge
         let split_label = if let Some(note) = split_note {
@@ -151,11 +121,14 @@ pub fn render(
         } else {
             format!("split: {:.0}%", (split_progress * 100.0).min(100.0))
         };
-        let split_gauge = LineGauge::default()
-            .label(split_label)
+        let split_gauge = Gauge::default()
             .gauge_style(Style::default().fg(Color::Yellow))
+            .use_unicode(true)
             .ratio(split_progress.min(1.0));
         frame.render_widget(split_gauge, gauge_rows[1]);
+        let split_line = colored_gauge_label(&split_label, gauge_rows[1].width, split_progress);
+        let split_para = Paragraph::new(split_line).alignment(Alignment::Center);
+        frame.render_widget(split_para, gauge_rows[1]);
 
         // Transcribe gauge
         let trans_label = if let Some(note) = trans_note {
@@ -167,11 +140,14 @@ pub fn render(
         } else {
             format!("transcribe: {:.0}%", (trans_progress * 100.0).min(100.0))
         };
-        let trans_gauge = LineGauge::default()
-            .label(trans_label)
+        let trans_gauge = Gauge::default()
             .gauge_style(Style::default().fg(Color::Cyan))
+            .use_unicode(true)
             .ratio(trans_progress.min(1.0));
         frame.render_widget(trans_gauge, gauge_rows[2]);
+        let trans_line = colored_gauge_label(&trans_label, gauge_rows[2].width, trans_progress);
+        let trans_para = Paragraph::new(trans_line).alignment(Alignment::Center);
+        frame.render_widget(trans_para, gauge_rows[2]);
 
         // Body: tabs header, content area (URL moved to its own tab)
         let body_constraints = vec![Constraint::Length(3), Constraint::Min(glyph_height as u16)];
@@ -194,7 +170,28 @@ pub fn render(
         // Tab content with scrollbar
         let content_area = split[1];
         let (content_title, content_text): (&str, String) = match tabs.get(selected_tab).map(|s| s.as_str()) {
-            Some("URL") => ("URL", display_url.to_string()),
+            Some("URL") => {
+                let primary = match (download_status, has_valid_link) {
+                    (DownloadStatus::Idle, true) => format!("ready: yt-dlp -> {}", output_target),
+                    (DownloadStatus::Running, true) => format!("downloader: yt-dlp running -> {}", output_target),
+                    (DownloadStatus::Success, true) => format!("download complete -> {}", output_target),
+                    (DownloadStatus::Failed, true) => format!(
+                        "download failed -> {}: {}",
+                        output_target,
+                        download_error.unwrap_or("unknown error")
+                    ),
+                    _ => String::new(),
+                };
+                let secondary = if matches!(download_status, DownloadStatus::Running) {
+                    if let Some(eta) = eta_text { format!("progress: {:.1}% ETA {}", progress * 100.0, eta) }
+                    else { format!("progress: {:.1}%", progress * 100.0) }
+                } else { String::new() };
+                let mut body = String::new();
+                if !primary.is_empty() { body.push_str(&primary); body.push('\n'); }
+                if !secondary.is_empty() { body.push_str(&secondary); body.push('\n'); }
+                body.push_str(display_url);
+                ("URL", body)
+            }
             Some("Transcription") => (
                 "Transcription",
                 transcript_text.unwrap_or("(no transcript yet)").to_string(),
@@ -253,7 +250,10 @@ pub fn render(
             .wrap(Wrap { trim: true })
             .block(content_block)
             .alignment(Alignment::Left)
-            .style(Style::new().fg(Color::DarkGray))
+            .style(Style::new().fg(match tabs.get(selected_tab).map(|s| s.as_str()) {
+                Some("URL") => Color::White,
+                _ => Color::DarkGray,
+            }))
             .scroll((y_scroll, 0));
         frame.render_widget(content_para, content_split[0]);
 
@@ -301,4 +301,35 @@ fn wrapped_lines_count(text: &str, inner_width: u16) -> u16 {
         total = total.saturating_add(chunks as u16);
     }
     if total == 0 { 1 } else { total }
+}
+
+fn colored_gauge_label(label: &str, row_width: u16, ratio: f64) -> Line<'static> {
+    let label_chars: Vec<char> = label.chars().collect();
+    let label_len = label_chars.len() as u16;
+    let width = row_width;
+    let start_col = width.saturating_sub(label_len) / 2; // centered start
+    let fill_cols = (ratio.max(0.0).min(1.0) * (width as f64)).floor() as u16;
+
+    let overlap = if fill_cols > start_col {
+        (fill_cols - start_col).min(label_len)
+    } else {
+        0
+    } as usize;
+
+    let (left, right) = if overlap > 0 {
+        let left: String = label_chars.iter().take(overlap).collect();
+        let right: String = label_chars.iter().skip(overlap).collect();
+        (left, right)
+    } else {
+        (String::new(), label.to_string())
+    };
+
+    let mut spans: Vec<Span> = Vec::new();
+    if !left.is_empty() {
+        spans.push(Span::styled(left, Style::default().fg(Color::White).bg(Color::Black)));
+    }
+    if !right.is_empty() {
+        spans.push(Span::styled(right, Style::default().fg(Color::White)));
+    }
+    Line::from(spans)
 }
