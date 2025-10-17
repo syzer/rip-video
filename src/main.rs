@@ -10,6 +10,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, TryRecvError},
+        Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -711,6 +712,15 @@ fn transcribe_parts_10(
     }
     wavs.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
 
+    // Probe durations and prepare weighted aggregation
+    let mut durations: Vec<f64> = Vec::with_capacity(wavs.len());
+    for path in &wavs {
+        let d = probe_duration_seconds(path.to_string_lossy().as_ref())?;
+        durations.push(d.max(0.001));
+    }
+    let total_duration: f64 = durations.iter().copied().sum::<f64>().max(0.001);
+    let progress_vec = Arc::new(Mutex::new(vec![0.0_f64; wavs.len()]));
+
     let total = wavs.len();
     let _ = tx.send(WorkerMessage::DownloadLog(format!(
         "transcribing {} files with concurrency={}, threads={}",
@@ -752,6 +762,10 @@ fn transcribe_parts_10(
             let tx_clone = tx.clone();
             let cancel_clone = Arc::clone(cancel);
             let ffmpeg_bin_clone = ffmpeg_bin.clone();
+            let progress_vec_clone = Arc::clone(&progress_vec);
+            let durations_clone = durations.clone();
+            let total_duration_clone = total_duration;
+            let part_index = wavs.iter().position(|p| p == &in_path).unwrap_or(0);
 
             handles.push(thread::spawn(move || -> Result<(), String> {
                 if cancel_clone.load(Ordering::SeqCst) {
@@ -762,34 +776,106 @@ fn transcribe_parts_10(
                     in_path.display(),
                     out_path.display()
                 )));
-                let status = Command::new(ffmpeg_bin_clone)
+                let mut child = Command::new(ffmpeg_bin_clone)
                     .args([
-                        "-loglevel",
-                        "error",
+                        "-loglevel", "error",
                         "-nostats",
-                        "-i",
-                        in_path.to_string_lossy().as_ref(),
-                        "-af",
-                        &af,
-                        "-f",
-                        "null",
-                        "-",
+                        "-progress", "pipe:2",
+                        "-stats_period", "0.5",
+                        "-i", in_path.to_string_lossy().as_ref(),
+                        "-af", &af,
+                        "-f", "null", "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::piped())
-                    .status()
+                    .spawn()
                     .map_err(|e| e.to_string())?;
-                if !status.success() {
-                    let code = status
-                        .code()
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "terminated by signal".to_string());
-                    return Err(format!(
-                        "ffmpeg-whisper exited with {code} for {}",
-                        in_path.display()
-                    ));
+
+                // Progress reader
+                if let Some(stderr) = child.stderr.take() {
+                    let mut reader = BufReader::new(stderr);
+                    let mut line = String::new();
+                    let part_duration = durations_clone[part_index].max(0.001);
+                    while !cancel_clone.load(Ordering::SeqCst) {
+                        line.clear();
+                        match reader.read_line(&mut line) {
+                            Ok(0) => break,
+                            Ok(_) => {
+                                let t = line.trim();
+                                if let Some(val) = t.strip_prefix("out_time_us=") {
+                                    if let Ok(us) = val.parse::<u64>() {
+                                        let ratio = (us as f64 / 1_000_000.0) / part_duration;
+                                        {
+                                            if let Ok(mut vec) = progress_vec_clone.lock() {
+                                                vec[part_index] = ratio.clamp(0.0, 1.0);
+                                                // aggregate weighted ratio
+                                                let mut acc = 0.0;
+                                                for (i, r) in vec.iter().enumerate() {
+                                                    acc += r.clamp(0.0, 1.0) * durations_clone[i];
+                                                }
+                                                let agg = (acc / total_duration_clone).clamp(0.0, 1.0);
+                                                let done = vec.iter().filter(|r| **r >= 0.999).count();
+                                                let _ = tx_clone.send(WorkerMessage::StageProgress {
+                                                    stage: Stage::Transcribe,
+                                                    ratio: agg,
+                                                    eta: None,
+                                                    note: Some(format!("{}/{}", done, durations_clone.len())),
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                                if t == "progress=end" {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
                 }
+
+                // wait for child completion and handle cancel
+                loop {
+                    if cancel_clone.load(Ordering::SeqCst) {
+                        let _ = child.kill();
+                    }
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            if !status.success() {
+                                let code = status
+                                    .code()
+                                    .map(|c| c.to_string())
+                                    .unwrap_or_else(|| "terminated by signal".to_string());
+                                return Err(format!(
+                                    "ffmpeg-whisper exited with {code} for {}",
+                                    in_path.display()
+                                ));
+                            }
+                            // mark part complete
+                            if let Ok(mut vec) = progress_vec_clone.lock() {
+                                vec[part_index] = 1.0;
+                                let mut acc = 0.0;
+                                for (i, r) in vec.iter().enumerate() {
+                                    acc += r.clamp(0.0, 1.0) * durations_clone[i];
+                                }
+                                let agg = (acc / total_duration_clone).clamp(0.0, 1.0);
+                                let done = vec.iter().filter(|r| **r >= 0.999).count();
+                                let _ = tx_clone.send(WorkerMessage::StageProgress {
+                                    stage: Stage::Transcribe,
+                                    ratio: agg,
+                                    eta: None,
+                                    note: Some(format!("{}/{}", done, durations_clone.len())),
+                                });
+                            }
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(err) => return Err(err.to_string()),
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+
                 Ok(())
             }));
         }
@@ -798,12 +884,21 @@ fn transcribe_parts_10(
             match handle.join() {
                 Ok(Ok(())) => {
                     completed += 1;
-                    let _ = tx.send(WorkerMessage::StageProgress {
-                        stage: Stage::Transcribe,
-                        ratio: (completed as f64) / (total as f64),
-                        eta: None,
-                        note: Some(format!("{}/{}", completed, total)),
-                    });
+                    // ratio updates already emitted during progress; still emit a final step tick
+                    if let Ok(vec) = progress_vec.lock() {
+                        let mut acc = 0.0;
+                        for (i, r) in vec.iter().enumerate() {
+                            acc += r.clamp(0.0, 1.0) * durations[i];
+                        }
+                        let agg = (acc / total_duration).clamp(0.0, 1.0);
+                        let done = vec.iter().filter(|r| **r >= 0.999).count();
+                        let _ = tx.send(WorkerMessage::StageProgress {
+                            stage: Stage::Transcribe,
+                            ratio: agg,
+                            eta: None,
+                            note: Some(format!("{}/{}", done, total)),
+                        });
+                    }
                 }
                 Ok(Err(err)) => return Err(err),
                 Err(_) => return Err("transcription thread panicked".into()),
