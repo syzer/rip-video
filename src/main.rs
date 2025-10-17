@@ -5,7 +5,6 @@ use std::{
     io::{self, BufRead, BufReader},
     process::{Command, Stdio},
     path::{Path, PathBuf},
-    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -184,7 +183,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                     download_status = DownloadStatus::Success;
                                     download_error = None;
                                     eta_text = None;
-                                    // After full pipeline success: load transcript; spawn minutes stream via ollama
+                                    // After full pipeline success: load transcript; spawn minutes stream via ollama if available
                                     if fs::metadata("transcript.txt").is_ok() {
                                         transcript_text = fs::read_to_string("transcript.txt").ok();
                                         if !tabs.iter().any(|t| t == "Transcription") {
@@ -193,15 +192,100 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                         if !tabs.iter().any(|t| t == "Minutes") {
                                             tabs.push("Minutes".to_string());
                                         }
-                                        // Show requirement message instead of generating
-                                        minutes_text = Some(
-                                            "Minutes generation requires ollama.\n\nInstall and run ollama, then create the minutes model:\n  ollama serve\n  ollama create minutes -f ~/endress/ai/ollama/minutes.model\n\nTo generate minutes manually:\n  ollama run minutes < transcript.txt\n".to_string(),
-                                        );
-                                        // Focus Minutes tab to display the message
-                                        if let Some(idx) = tabs.iter().position(|t| t == "Minutes") {
-                                            selected_tab = idx;
+                                        let ollama_ok = Command::new("ollama")
+                                            .arg("--version")
+                                            .stdin(Stdio::null())
+                                            .stdout(Stdio::null())
+                                            .stderr(Stdio::null())
+                                            .status()
+                                            .ok()
+                                            .map(|s| s.success())
+                                            .unwrap_or(false);
+                                        if ollama_ok {
+                                            // Start minutes streaming thread
+                                            minutes_text = Some(String::new());
+                                            let (mtx, mrx) = mpsc::channel();
+                                            let cancel_new = Arc::new(AtomicBool::new(false));
+                                            let cancel_clone = Arc::clone(&cancel_new);
+                                            thread::spawn(move || {
+                                                // Stream: cat transcript.txt | ollama run minutes
+                                                let path = Path::new("transcript.txt");
+                                                let data = match fs::read(path) {
+                                                    Ok(b) => b,
+                                                    Err(e) => {
+                                                        let _ = mtx.send(WorkerMessage::MinutesDone(Err(e.to_string())));
+                                                        return;
+                                                    }
+                                                };
+                                                let mut child = match Command::new("ollama")
+                                                    .args(["run", "minutes"]) // requires installed minutes model
+                                                    .stdin(Stdio::piped())
+                                                    .stdout(Stdio::piped())
+                                                    .stderr(Stdio::piped())
+                                                    .spawn()
+                                                {
+                                                    Ok(c) => c,
+                                                    Err(e) => {
+                                                        let _ = mtx.send(WorkerMessage::MinutesDone(Err(e.to_string())));
+                                                        return;
+                                                    }
+                                                };
+                                                // Write transcript to stdin
+                                                if let Some(mut stdin) = child.stdin.take() {
+                                                    let _ = std::io::Write::write_all(&mut stdin, &data);
+                                                }
+                                                // Read stdout streaming
+                                                if let Some(stdout) = child.stdout.take() {
+                                                    let mut reader = BufReader::new(stdout);
+                                                    let mut line = String::new();
+                                                    loop {
+                                                        if cancel_clone.load(Ordering::SeqCst) {
+                                                            let _ = child.kill();
+                                                            let _ = mtx.send(WorkerMessage::MinutesDone(Err("canceled".into())));
+                                                            return;
+                                                        }
+                                                        line.clear();
+                                                        match reader.read_line(&mut line) {
+                                                            Ok(0) => break,
+                                                            Ok(_) => {
+                                                                let _ = mtx.send(WorkerMessage::MinutesChunk(line.clone()));
+                                                            }
+                                                            Err(_) => break,
+                                                        }
+                                                    }
+                                                }
+                                                // Wait and report status
+                                                match child.wait() {
+                                                    Ok(status) if status.success() => {
+                                                        let _ = mtx.send(WorkerMessage::MinutesDone(Ok(())));
+                                                    }
+                                                    Ok(status) => {
+                                                        let code = status.code().map(|c| c.to_string()).unwrap_or_else(|| "terminated by signal".to_string());
+                                                        let _ = mtx.send(WorkerMessage::MinutesDone(Err(format!("ollama exit {code}"))));
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = mtx.send(WorkerMessage::MinutesDone(Err(e.to_string())));
+                                                    }
+                                                }
+                                            });
+                                            download_rx = Some(mrx);
+                                            worker_cancel = Some(cancel_new);
+                                            // Focus minutes tab to watch streaming
+                                            if let Some(idx) = tabs.iter().position(|t| t == "Minutes") {
+                                                selected_tab = idx;
+                                            }
+                                            // Reset scroll for minutes
+                                            scroll_minutes = 0;
+                                        } else {
+                                            // Show requirement message if ollama missing
+                                            minutes_text = Some(
+                                                "Minutes generation requires ollama.\n\nInstall and run ollama, then create the minutes model:\n  ollama serve\n  ollama create minutes -f minutes.model\n\nTo generate minutes manually:\n  ollama run minutes < transcript.txt\n".to_string(),
+                                            );
+                                            if let Some(idx) = tabs.iter().position(|t| t == "Minutes") {
+                                                selected_tab = idx;
+                                            }
+                                            scroll_minutes = 0;
                                         }
-                                        scroll_minutes = 0;
                                     }
                                 }
                                 Err(err) => {
@@ -955,7 +1039,7 @@ fn transcribe_parts_10(
     Ok(())
 }
 
-fn generate_minutes(transcript: &str, max_sentences: usize) -> String {
+fn generate_minutes(transcript: &str, _max_sentences: usize) -> String {
     // Prefer local Ollama if available
     if Command::new("ollama").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().ok().map(|s| s.success()).unwrap_or(false) {
         if let Ok(mut child) = Command::new("ollama")
@@ -978,81 +1062,6 @@ fn generate_minutes(transcript: &str, max_sentences: usize) -> String {
             }
         }
     }
-
-    // Local fallback summarizer (frequency-based extractive)
-    // Basic frequency-based extractive summary: pick top-N informative sentences.
-    let stopwords = [
-        "the","a","an","and","or","but","if","then","else","when","while","to","of","in","on","for","with","as","by","from","at","that","this","it","is","are","was","were","be","been","being","i","you","he","she","we","they","them","us","our","your","their","so","just","not","do","does","did","can","could","should","would","will","about","into","over","under","up","down","out","more","most","less","few","very","also","than","such","may","might","there","here","have","has","had","his","her","its","our","their","what","which","who","whom","because","while","where","how","why",
-    ];
-    let stop: std::collections::HashSet<&str> = stopwords.iter().copied().collect();
-
-    // Split into sentences (naive)
-    let mut sentences: Vec<(String, usize)> = Vec::new();
-    let mut start = 0usize;
-    let chars: Vec<char> = transcript.chars().collect();
-    for (i, ch) in chars.iter().enumerate() {
-        if matches!(ch, '.' | '!' | '?') {
-            let s = chars[start..=i].iter().collect::<String>();
-            let s_trim = s.trim().to_string();
-            if s_trim.len() > 40 { // skip tiny fragments
-                sentences.push((s_trim, sentences.len()));
-            }
-            start = i + 1;
-        }
-    }
-    if start < chars.len() {
-        let s = chars[start..].iter().collect::<String>();
-        let s_trim = s.trim().to_string();
-        if s_trim.len() > 40 {
-            sentences.push((s_trim, sentences.len()));
-        }
-    }
-
-    // Fallback: if no sentence markers present, treat by lines
-    if sentences.is_empty() {
-        for (idx, line) in transcript.lines().enumerate() {
-            let s = line.trim();
-            if s.len() > 40 { sentences.push((s.to_string(), idx)); }
-        }
-    }
-
-    // Build frequency map
-    let mut freq: HashMap<String, usize> = HashMap::new();
-    for (s, _) in &sentences {
-        for w in s.split(|c: char| !c.is_alphanumeric()) {
-            let w = w.to_lowercase();
-            if w.is_empty() || stop.contains(w.as_str()) { continue; }
-            *freq.entry(w).or_insert(0) += 1;
-        }
-    }
-
-    // Score sentences
-    let mut scored: Vec<(f64, usize, String)> = Vec::new();
-    for (s, idx) in &sentences {
-        let mut score = 0usize;
-        for w in s.split(|c: char| !c.is_alphanumeric()) {
-            let w = w.to_lowercase();
-            if let Some(c) = freq.get(&w) { score += *c; }
-        }
-        // Normalize by sentence length to prefer concise sentences
-        let len = s.split_whitespace().count().max(1) as f64;
-        let s_score = (score as f64) / len;
-        scored.push((s_score, *idx, s.clone()));
-    }
-
-    // Take top-N by score, then sort by original order
-    let take = max_sentences.min(scored.len());
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    let mut top: Vec<(usize, String)> = scored.into_iter().take(take).map(|(_, idx, s)| (idx, s)).collect();
-    top.sort_by_key(|(idx, _)| *idx);
-
-    // Build minutes text
-    let mut out = String::new();
-    out.push_str("Key Points\n\n");
-    for (_, s) in top {
-        out.push_str("- ");
-        out.push_str(s.trim());
-        if !out.ends_with('\n') { out.push('\n'); }
-    }
-    out
+    // Fallback message if Ollama is unavailable or returns no output
+    "Minutes generation requires ollama.\n\nInstall and run ollama, then create the minutes model:\n  ollama serve\n  ollama create minutes -f minutes.model\n\nTo generate minutes manually:\n  ollama run minutes < transcript.txt\n".to_string()
 }

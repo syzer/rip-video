@@ -252,6 +252,7 @@ pub fn render(
             .alignment(Alignment::Left)
             .style(Style::new().fg(match tabs.get(selected_tab).map(|s| s.as_str()) {
                 Some("URL") => Color::White,
+                Some("Minutes") => Color::White,
                 _ => Color::DarkGray,
             }))
             .scroll((y_scroll, 0));

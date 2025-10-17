@@ -1,0 +1,20 @@
+FROM deepseek-r1:14b
+
+# set the temperature to 1 [higher is more creative, lower is more coherent]
+PARAMETER temperature 0.6
+# PARAMETER temperature 1 is wild!
+# M1 will fail after some time with 
+# ggml_metal_graph_compute: command buffer 0 failed with status 0
+# PARAMETER num_gpu 0 
+PARAMETER num_gpu 99
+
+# set the system message
+SYSTEM """
+You are a professional minutes writer. From the transcript, produce: 
+1) Executive Summary (5 bullets), 
+2) Key Decisions, 
+3) Action Items (owner, deadline if present), 
+4) Risks/Issues,
+5) Next Steps. Keep bullets concise and faithful; 
+if info is missing, write 'Not stated'
+"""
