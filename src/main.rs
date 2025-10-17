@@ -5,6 +5,7 @@ use std::{
     io::{self, BufRead, BufReader},
     process::{Command, Stdio},
     path::{Path, PathBuf},
+    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -15,22 +16,17 @@ use std::{
 };
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{
-    Terminal,
-    backend::{Backend, CrosstermBackend},
-    layout::{Alignment, Constraint, Direction, Layout},
-    style::{Color, Style},
-    text::Line,
-    widgets::{Block, Borders, LineGauge, Paragraph, Wrap},
-};
+use ratatui::{Terminal, backend::{Backend, CrosstermBackend}};
 
 mod banner;
+mod keyboard;
+mod ui;
 
-use banner::Banner;
+// Banner used within ui module
 
 const GLYPH_HEIGHT: usize = 5;
 const DEBUG_MAX_LINES: usize = 200;
@@ -98,6 +94,20 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
     let mut worker_cancel: Option<Arc<AtomicBool>> = None;
     let mut debug_lines: Vec<String> = Vec::new();
     let mut eta_text: Option<String> = None;
+    // Tabs state: start with URL + Logs; add Transcription/Minutes on finish
+    let mut tabs: Vec<String> = vec!["URL".to_string(), "Logs".to_string()];
+    let mut selected_tab: usize = 0;
+    let mut transcript_text: Option<String> = None;
+    let mut minutes_text: Option<String> = None;
+    // Scroll states per tab
+    let mut scroll_logs: u16 = 0;
+    let mut scroll_trans: u16 = 0;
+    let mut scroll_minutes: u16 = 0;
+    // Cached content lengths for scrolling and last viewport height
+    let mut logs_lines_count: u16 = 0;
+    let mut trans_lines_count: u16 = 0;
+    let mut minutes_lines_count: u16 = 0;
+    let mut last_viewport_lines: u16 = 0;
 
     loop {
         if has_valid_link {
@@ -171,6 +181,28 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                     download_status = DownloadStatus::Success;
                                     download_error = None;
                                     eta_text = None;
+                                    // Add Transcription tab and load content if available
+                                    if fs::metadata("transcript.txt").is_ok() {
+                                        transcript_text = fs::read_to_string("transcript.txt").ok();
+                                        // Add tabs if missing
+                                        if !tabs.iter().any(|t| t == "Transcription") {
+                                            tabs.push("Transcription".to_string());
+                                        }
+                                        // Generate minutes from transcript
+                                        if let Some(txt) = transcript_text.as_ref() {
+                                            minutes_text = Some(generate_minutes(txt, 20));
+                                            if !tabs.iter().any(|t| t == "Minutes") {
+                                                tabs.push("Minutes".to_string());
+                                            }
+                                        }
+                                        // Reset scroll positions for new content
+                                        scroll_trans = 0;
+                                        scroll_minutes = 0;
+                                        // Focus transcription by default
+                                        if let Some(idx) = tabs.iter().position(|t| t == "Transcription") {
+                                            selected_tab = idx;
+                                        }
+                                    }
                                 }
                                 Err(err) => {
                                     progress = 0.0;
@@ -211,198 +243,51 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
         }
 
         terminal.draw(|frame| {
-            let area = frame.size();
-            let centered = Layout::default()
-                .direction(Direction::Vertical)
-                .margin(2)
-                .constraints([Constraint::Min(GLYPH_HEIGHT as u16 + 6)].as_ref())
-                .split(area);
-
-            let block = Block::default().title("Message").borders(Borders::ALL);
-            let inner = block.inner(centered[0]);
-            frame.render_widget(block, centered[0]);
-
-            let mut status_lines: Vec<(String, Color)> = Vec::new();
-            match (&download_status, has_valid_link) {
-                (DownloadStatus::Idle, true) => {
-                    status_lines.push((format!("ready: yt-dlp -> {}", output_target), Color::Gray))
-                }
-                (DownloadStatus::Running, true) => status_lines.push((
-                    format!("downloader: yt-dlp running -> {output_target}"),
-                    Color::Cyan,
-                )),
-                (DownloadStatus::Success, true) => status_lines.push((
-                    format!("download complete -> {output_target}"),
-                    Color::LightGreen,
-                )),
-                (DownloadStatus::Failed, true) => status_lines.push((
-                    format!(
-                        "download failed -> {}: {}",
-                        output_target,
-                        download_error.as_deref().unwrap_or("unknown error")
-                    ),
-                    Color::Red,
-                )),
-                _ => {}
-            }
-
-            if matches!(download_status, DownloadStatus::Running) {
-                if let Some(eta) = eta_text.as_ref() {
-                    status_lines.push((
-                        format!("progress: {:.1}% ETA {eta}", progress * 100.0),
-                        Color::Cyan,
-                    ));
-                } else {
-                    status_lines.push((format!("progress: {:.1}%", progress * 100.0), Color::Cyan));
-                }
-            }
-
-            let status_height = status_lines.len().max(1) as u16;
-                let constraints: Vec<Constraint> = if has_valid_link {
-                    vec![
-                        Constraint::Length(GLYPH_HEIGHT as u16),
-                        Constraint::Length(status_height),
-                        Constraint::Length(3),
-                        Constraint::Min(GLYPH_HEIGHT as u16),
-                    ]
-                } else {
-                    vec![
-                        Constraint::Length(GLYPH_HEIGHT as u16),
-                        Constraint::Length(status_height),
-                        Constraint::Min(GLYPH_HEIGHT as u16),
-                    ]
-                };
-
-            let sections = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints(constraints)
-                .split(inner);
-
-            let header = Banner::new("rip Video")
-                .style(Style::new().fg(Color::Yellow))
-                .spacing(0);
-            frame.render_widget(header, sections[0]);
-
-            if !status_lines.is_empty() {
-                let lines: Vec<Line> = status_lines
-                    .into_iter()
-                    .map(|(text, color)| Line::styled(text, Style::new().fg(color)))
-                    .collect();
-                let status_paragraph = Paragraph::new(lines).alignment(Alignment::Center);
-                frame.render_widget(status_paragraph, sections[1]);
-            }
-
-            if has_valid_link {
-                let gauge_area = sections[2];
-                let body_area = sections[3];
-
-                // Split gauge_area into three rows for the three pipeline stages
-                let gauge_rows = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(1),
-                        Constraint::Length(1),
-                        Constraint::Length(1),
-                    ])
-                    .split(gauge_area);
-
-                // Download gauge
-                let dl_label = if let Some(eta) = eta_text.as_ref() {
-                    format!("dl: {:.0}% ETA {}", (progress * 100.0).min(100.0), eta)
-                } else {
-                    format!("dl: {:.0}%", (progress * 100.0).min(100.0))
-                };
-                let dl_gauge = LineGauge::default()
-                    .label(dl_label)
-                    .gauge_style(Style::default().fg(Color::LightGreen))
-                    .ratio(progress.min(1.0));
-                frame.render_widget(dl_gauge, gauge_rows[0]);
-
-                // Split gauge
-                let split_label = if let Some(note) = split_note.as_ref() {
-                    format!("split: {:.0}% ({})", (split_progress * 100.0).min(100.0), note)
-                } else {
-                    format!("split: {:.0}%", (split_progress * 100.0).min(100.0))
-                };
-                let split_gauge = LineGauge::default()
-                    .label(split_label)
-                    .gauge_style(Style::default().fg(Color::Yellow))
-                    .ratio(split_progress.min(1.0));
-                frame.render_widget(split_gauge, gauge_rows[1]);
-
-                // Transcribe gauge
-                let trans_label = if let Some(note) = trans_note.as_ref() {
-                    format!(
-                        "transcribe: {:.0}% ({})",
-                        (trans_progress * 100.0).min(100.0),
-                        note
-                    )
-                } else {
-                    format!(
-                        "transcribe: {:.0}%",
-                        (trans_progress * 100.0).min(100.0)
-                    )
-                };
-                let trans_gauge = LineGauge::default()
-                    .label(trans_label)
-                    .gauge_style(Style::default().fg(Color::Cyan))
-                    .ratio(trans_progress.min(1.0));
-                frame.render_widget(trans_gauge, gauge_rows[2]);
-
-                let debug_present = !debug_lines.is_empty();
-
-                let link_display =
-                    chunk_text_to_width(display_url.as_str(), (body_area.width).max(1) as usize);
-                let link_line_count = link_display.lines().count().max(1) as u16;
-
-                let mut body_constraints = vec![Constraint::Length(link_line_count)];
-                if debug_present {
-                    let debug_height =
-                        (debug_lines.len().max(1) as u16).min(DEBUG_MAX_LINES as u16) + 2;
-                    body_constraints.push(Constraint::Length(debug_height));
-                }
-
-                let split = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints(body_constraints)
-                    .split(body_area);
-
-                let mut index = 0;
-                let link_area = split[index];
-                index += 1;
-
-                let link_para = Paragraph::new(link_display)
-                    .alignment(Alignment::Left)
-                    .style(Style::new().fg(Color::White));
-                frame.render_widget(link_para, link_area);
-
-                if debug_present {
-                    let debug_area = split[index];
-                    let debug_block = Block::default().title("Debug").borders(Borders::ALL);
-                    let debug_text = debug_lines.join("\n");
-                    let debug_para = Paragraph::new(debug_text)
-                        .wrap(Wrap { trim: true })
-                        .block(debug_block)
-                        .alignment(Alignment::Left)
-                        .style(Style::new().fg(Color::DarkGray));
-                    frame.render_widget(debug_para, debug_area);
-                }
-            } else {
-                let body_area = sections[2];
-                let hint = Paragraph::new(
-                    "go to chrome terminal, find a url for `videomanifest`, and copy a URL",
-                )
-                .alignment(Alignment::Center)
-                .style(Style::new().fg(Color::Red));
-                frame.render_widget(hint, body_area);
-            }
+            ui::render(
+                frame,
+                display_url.as_str(),
+                &output_target,
+                has_valid_link,
+                download_status,
+                download_error.as_deref(),
+                progress,
+                eta_text.as_deref(),
+                split_progress,
+                split_note.as_deref(),
+                trans_progress,
+                trans_note.as_deref(),
+                &debug_lines,
+                &tabs,
+                selected_tab,
+                transcript_text.as_deref(),
+                minutes_text.as_deref(),
+                &mut scroll_logs,
+                &mut scroll_trans,
+                &mut scroll_minutes,
+                &mut logs_lines_count,
+                &mut trans_lines_count,
+                &mut minutes_lines_count,
+                &mut last_viewport_lines,
+                GLYPH_HEIGHT,
+                DEBUG_MAX_LINES,
+            );
         })?;
 
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press
-                    && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter)
-                {
+                let should_exit = keyboard::handle_key(
+                    &key,
+                    &tabs,
+                    &mut selected_tab,
+                    &mut scroll_logs,
+                    &mut scroll_trans,
+                    &mut scroll_minutes,
+                    logs_lines_count,
+                    trans_lines_count,
+                    minutes_lines_count,
+                    last_viewport_lines,
+                );
+                if should_exit {
                     if let Some(cancel) = worker_cancel.take() {
                         cancel.store(true, Ordering::SeqCst);
                     }
@@ -609,20 +494,7 @@ fn download_worker(
         thread::sleep(Duration::from_millis(100));
     }
 }
-fn chunk_text_to_width(text: &str, width: usize) -> String {
-    let width = width.max(1);
-    let mut output = String::new();
-    let mut current = 0;
-    for ch in text.chars() {
-        if current >= width {
-            output.push('\n');
-            current = 0;
-        }
-        output.push(ch);
-        current += 1;
-    }
-    output
-}
+// chunk_text_to_width moved to ui module
 
 fn parse_ytdlp_progress(line: &str) -> Option<(f64, Option<String>)> {
     if !line.starts_with("[download]") || !line.contains('%') {
@@ -953,7 +825,7 @@ fn transcribe_parts_10(
             .join(Path::new(path.file_name().unwrap()).with_extension("txt"));
         if txt.exists() {
             match fs::read_to_string(&txt) {
-                Ok(mut s) => {
+                Ok(s) => {
                     if !transcript.is_empty() && !transcript.ends_with('\n') {
                         transcript.push('\n');
                     }
@@ -977,4 +849,82 @@ fn transcribe_parts_10(
         "transcript written to transcript.txt".to_string(),
     ));
     Ok(())
+}
+
+fn generate_minutes(transcript: &str, max_sentences: usize) -> String {
+    // Basic frequency-based extractive summary: pick top-N informative sentences.
+    let stopwords = [
+        "the","a","an","and","or","but","if","then","else","when","while","to","of","in","on","for","with","as","by","from","at","that","this","it","is","are","was","were","be","been","being","i","you","he","she","we","they","them","us","our","your","their","so","just","not","do","does","did","can","could","should","would","will","about","into","over","under","up","down","out","more","most","less","few","very","also","than","such","may","might","there","here","have","has","had","his","her","its","our","their","what","which","who","whom","because","while","where","how","why",
+    ];
+    let stop: std::collections::HashSet<&str> = stopwords.iter().copied().collect();
+
+    // Split into sentences (naive)
+    let mut sentences: Vec<(String, usize)> = Vec::new();
+    let mut start = 0usize;
+    let chars: Vec<char> = transcript.chars().collect();
+    for (i, ch) in chars.iter().enumerate() {
+        if matches!(ch, '.' | '!' | '?') {
+            let s = chars[start..=i].iter().collect::<String>();
+            let s_trim = s.trim().to_string();
+            if s_trim.len() > 40 { // skip tiny fragments
+                sentences.push((s_trim, sentences.len()));
+            }
+            start = i + 1;
+        }
+    }
+    if start < chars.len() {
+        let s = chars[start..].iter().collect::<String>();
+        let s_trim = s.trim().to_string();
+        if s_trim.len() > 40 {
+            sentences.push((s_trim, sentences.len()));
+        }
+    }
+
+    // Fallback: if no sentence markers present, treat by lines
+    if sentences.is_empty() {
+        for (idx, line) in transcript.lines().enumerate() {
+            let s = line.trim();
+            if s.len() > 40 { sentences.push((s.to_string(), idx)); }
+        }
+    }
+
+    // Build frequency map
+    let mut freq: HashMap<String, usize> = HashMap::new();
+    for (s, _) in &sentences {
+        for w in s.split(|c: char| !c.is_alphanumeric()) {
+            let w = w.to_lowercase();
+            if w.is_empty() || stop.contains(w.as_str()) { continue; }
+            *freq.entry(w).or_insert(0) += 1;
+        }
+    }
+
+    // Score sentences
+    let mut scored: Vec<(f64, usize, String)> = Vec::new();
+    for (s, idx) in &sentences {
+        let mut score = 0usize;
+        for w in s.split(|c: char| !c.is_alphanumeric()) {
+            let w = w.to_lowercase();
+            if let Some(c) = freq.get(&w) { score += *c; }
+        }
+        // Normalize by sentence length to prefer concise sentences
+        let len = s.split_whitespace().count().max(1) as f64;
+        let s_score = (score as f64) / len;
+        scored.push((s_score, *idx, s.clone()));
+    }
+
+    // Take top-N by score, then sort by original order
+    let take = max_sentences.min(scored.len());
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut top: Vec<(usize, String)> = scored.into_iter().take(take).map(|(_, idx, s)| (idx, s)).collect();
+    top.sort_by_key(|(idx, _)| *idx);
+
+    // Build minutes text
+    let mut out = String::new();
+    out.push_str("Key Points\n\n");
+    for (_, s) in top {
+        out.push_str("- ");
+        out.push_str(s.trim());
+        if !out.ends_with('\n') { out.push('\n'); }
+    }
+    out
 }
