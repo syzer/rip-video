@@ -5,6 +5,8 @@ use ratatui::{
     widgets::{Block, Borders, Gauge, Paragraph, Tabs, Wrap, Scrollbar, ScrollbarState},
     Frame,
 };
+#[cfg(feature = "markdown")]
+use tui_markdown::Markdown;
 
 use crate::banner::Banner;
 use crate::DownloadStatus;
@@ -268,10 +270,37 @@ pub fn render(
             Some("Minutes") => *scroll_minutes,
             _ => *scroll_logs,
         };
-        // Build paragraph; for Minutes, gray out "Thinking..." blocks
-        let content_para = if tabs.get(selected_tab).map(|s| s.as_str()) == Some("Minutes") {
+        let is_minutes_tab = tabs.get(selected_tab).map(|s| s.as_str()) == Some("Minutes");
+        let rendered_markdown;
+        // If Minutes tab and markdown feature enabled, render Markdown for content after "done thinking"
+        #[cfg(feature = "markdown")]
+        if is_minutes_tab {
+            // Extract everything after a line containing "done thinking" (case-insensitive)
+            let mut after = false;
+            let mut post = String::new();
+            for raw in content_text.lines() {
+                let lower = raw.trim().to_ascii_lowercase();
+                if !after {
+                    if lower.contains("done thinking") { after = true; continue; }
+                } else {
+                    post.push_str(raw);
+                    post.push('\n');
+                }
+            }
+            if !post.trim().is_empty() {
+                let md = Markdown::new(post.as_str());
+                frame.render_widget(md, content_split[0]);
+                rendered_markdown = true;
+            }
+        }
+        #[cfg(not(feature = "markdown"))]
+        { rendered_markdown = false; }
+
+        // Build paragraph; for Minutes, gray out "Thinking..." blocks and render simple Markdown (#, ####, **bold**, **** rule)
+        let content_para = if is_minutes_tab && !rendered_markdown {
             let mut lines_vec: Vec<Line> = Vec::new();
             let mut thinking = false;
+            let view_width = content_split[0].width.saturating_sub(2); // inner block width approx
             for raw in content_text.lines() {
                 let t = raw.trim_start();
                 let lower = t.to_ascii_lowercase();
@@ -279,7 +308,7 @@ pub fn render(
                 if thinking {
                     lines_vec.push(Line::from(Span::styled(raw.to_string(), Style::default().fg(Color::DarkGray))));
                 } else {
-                    lines_vec.push(Line::from(Span::styled(raw.to_string(), Style::default().fg(Color::White))));
+                    lines_vec.push(render_simple_markdown_line(raw, view_width));
                 }
                 if lower.starts_with("...done thinking") || lower.starts_with("done thinking") || lower.contains("done thinking") {
                     thinking = false;
@@ -301,7 +330,9 @@ pub fn render(
                 }))
                 .scroll((y_scroll, 0))
         };
-        frame.render_widget(content_para, content_split[0]);
+        if !rendered_markdown {
+            frame.render_widget(content_para, content_split[0]);
+        }
 
         // Scrollbar for the right column
         let total_lines = lines_count.max(1) as usize;
@@ -376,6 +407,52 @@ fn colored_gauge_label(label: &str, row_width: u16, ratio: f64) -> Line<'static>
     }
     if !right.is_empty() {
         spans.push(Span::styled(right, Style::default().fg(Color::White)));
+    }
+    Line::from(spans)
+}
+
+fn render_simple_markdown_line(raw: &str, width: u16) -> Line<'static> {
+    let t = raw.trim_end();
+    let trimmed = t.trim_start();
+    // Horizontal rule if line is only asterisks (*** or ****)
+    if !trimmed.is_empty() && trimmed.chars().all(|c| c == '*') && trimmed.len() >= 3 {
+        let w = width.max(1) as usize;
+        let hr = "─".repeat(w.min(200));
+        return Line::from(Span::styled(hr, Style::default().fg(Color::DarkGray)));
+    }
+    // Headings ####, ###, ##, #
+    let mut level = 0usize;
+    for ch in trimmed.chars() {
+        if ch == '#' { level += 1; } else { break; }
+    }
+    if level > 0 && trimmed.chars().nth(level) == Some(' ') {
+        let content = &trimmed[level + 1..];
+        let style = Style::default().fg(Color::White);
+        return Line::from(Span::styled(content.to_string(), style));
+    }
+    // Bold **text**
+    let mut spans: Vec<Span> = Vec::new();
+    let mut i = 0usize;
+    let bytes = trimmed.as_bytes();
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'*' {
+            // find closing **
+            let mut j = i + 2;
+            while j + 1 < bytes.len() {
+                if bytes[j] == b'*' && bytes[j + 1] == b'*' { break; }
+                j += 1;
+            }
+            if j + 1 < bytes.len() {
+                let bold_text = &trimmed[i + 2..j];
+                spans.push(Span::styled(bold_text.to_string(), Style::default().fg(Color::White)));
+                i = j + 2;
+                continue;
+            }
+        }
+        // normal char
+        let ch = bytes[i] as char;
+        spans.push(Span::styled(ch.to_string(), Style::default().fg(Color::White)));
+        i += 1;
     }
     Line::from(spans)
 }
