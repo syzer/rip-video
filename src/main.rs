@@ -54,6 +54,8 @@ enum WorkerMessage {
     StageProgress { stage: Stage, ratio: f64, eta: Option<String>, note: Option<String> },
     Status(Result<(), String>),
     DownloadLog(String),
+    MinutesChunk(String),
+    MinutesDone(Result<(), String>),
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -182,27 +184,24 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                     download_status = DownloadStatus::Success;
                                     download_error = None;
                                     eta_text = None;
-                                    // Add Transcription tab and load content if available
+                                    // After full pipeline success: load transcript; spawn minutes stream via ollama
                                     if fs::metadata("transcript.txt").is_ok() {
                                         transcript_text = fs::read_to_string("transcript.txt").ok();
-                                        // Add tabs if missing
                                         if !tabs.iter().any(|t| t == "Transcription") {
                                             tabs.push("Transcription".to_string());
                                         }
-                                        // Generate minutes from transcript
-                                        if let Some(txt) = transcript_text.as_ref() {
-                                            minutes_text = Some(generate_minutes(txt, 20));
-                                            if !tabs.iter().any(|t| t == "Minutes") {
-                                                tabs.push("Minutes".to_string());
-                                            }
+                                        if !tabs.iter().any(|t| t == "Minutes") {
+                                            tabs.push("Minutes".to_string());
                                         }
-                                        // Reset scroll positions for new content
-                                        scroll_trans = 0;
-                                        scroll_minutes = 0;
-                                        // Focus transcription by default
-                                        if let Some(idx) = tabs.iter().position(|t| t == "Transcription") {
+                                        // Show requirement message instead of generating
+                                        minutes_text = Some(
+                                            "Minutes generation requires ollama.\n\nInstall and run ollama, then create the minutes model:\n  ollama serve\n  ollama create minutes -f ~/endress/ai/ollama/minutes.model\n\nTo generate minutes manually:\n  ollama run minutes < transcript.txt\n".to_string(),
+                                        );
+                                        // Focus Minutes tab to display the message
+                                        if let Some(idx) = tabs.iter().position(|t| t == "Minutes") {
                                             selected_tab = idx;
                                         }
+                                        scroll_minutes = 0;
                                     }
                                 }
                                 Err(err) => {
@@ -214,6 +213,16 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                     eta_text = None;
                                 }
                             }
+                        }
+                        WorkerMessage::MinutesChunk(chunk) => {
+                            match minutes_text.as_mut() {
+                                Some(s) => s.push_str(&chunk),
+                                None => minutes_text = Some(chunk),
+                            }
+                        }
+                        WorkerMessage::MinutesDone(_res) => {
+                            download_rx = None;
+                            worker_cancel = None;
                         }
                         WorkerMessage::DownloadLog(line) => {
                             debug_lines.push(line);
@@ -947,6 +956,30 @@ fn transcribe_parts_10(
 }
 
 fn generate_minutes(transcript: &str, max_sentences: usize) -> String {
+    // Prefer local Ollama if available
+    if Command::new("ollama").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().ok().map(|s| s.success()).unwrap_or(false) {
+        if let Ok(mut child) = Command::new("ollama")
+            .args(["run", "minutes"]) // requires `ollama create minutes -f ...`
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = std::io::Write::write_all(&mut stdin, transcript.as_bytes());
+            }
+            if let Ok(out) = child.wait_with_output() {
+                if out.status.success() {
+                    if let Ok(text) = String::from_utf8(out.stdout) {
+                        let trimmed = text.trim().to_string();
+                        if !trimmed.is_empty() { return trimmed; }
+                    }
+                }
+            }
+        }
+    }
+
+    // Local fallback summarizer (frequency-based extractive)
     // Basic frequency-based extractive summary: pick top-N informative sentences.
     let stopwords = [
         "the","a","an","and","or","but","if","then","else","when","while","to","of","in","on","for","with","as","by","from","at","that","this","it","is","are","was","were","be","been","being","i","you","he","she","we","they","them","us","our","your","their","so","just","not","do","does","did","can","could","should","would","will","about","into","over","under","up","down","out","more","most","less","few","very","also","than","such","may","might","there","here","have","has","had","his","her","its","our","their","what","which","who","whom","because","while","where","how","why",
