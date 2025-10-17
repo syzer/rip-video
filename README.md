@@ -5,6 +5,7 @@ How to use (macOS)
 - If you haven't yet, create the local minutes model: `just create-minutes` (one-time).
 - Run `just` (shorthand for `CLIPBOARD_TEXT="$(pbpaste)" cargo run`).
 - The app will pick the URL from the clipboard, download audio, split, transcribe, and prepare Minutes.
+- To remove generated artifacts (audio, parts, transcript, minutes), run: `just reset`.
 
 This repository includes a TUI to download audio, split into parts, transcribe with ffmpeg-whisper, and optionally generate meeting minutes via the OpenAI API.
 

@@ -23,6 +23,8 @@ pub fn render(
     split_note: Option<&str>,
     trans_progress: f64,
     trans_note: Option<&str>,
+    minutes_progress: f64,
+    minutes_note: Option<&str>,
     debug_lines: &Vec<String>,
     tabs: &Vec<String>,
     selected_tab: usize,
@@ -56,7 +58,7 @@ pub fn render(
         vec![
             Constraint::Length(glyph_height as u16),
             Constraint::Length(status_height),
-            Constraint::Length(6),
+            Constraint::Length(8),
             Constraint::Min(glyph_height as u16),
             Constraint::Length(1), // footer
         ]
@@ -90,10 +92,11 @@ pub fn render(
         let gauge_area = sections[2];
         let body_area = sections[3];
 
-        // Split gauge_area into three rows for the three pipeline stages
+        // Split gauge_area into four rows for the pipeline stages
         let gauge_rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
+                Constraint::Length(2),
                 Constraint::Length(2),
                 Constraint::Length(2),
                 Constraint::Length(2),
@@ -107,7 +110,7 @@ pub fn render(
             format!("dl: {:.0}%", (progress * 100.0).min(100.0))
         };
         let dl_gauge = Gauge::default()
-            .gauge_style(Style::default().fg(Color::LightGreen))
+            .gauge_style(Style::default().fg(Color::Red))
             .use_unicode(true)
             .ratio(progress.min(1.0));
         frame.render_widget(dl_gauge, gauge_rows[0]);
@@ -141,13 +144,32 @@ pub fn render(
             format!("transcribe: {:.0}%", (trans_progress * 100.0).min(100.0))
         };
         let trans_gauge = Gauge::default()
-            .gauge_style(Style::default().fg(Color::Cyan))
+            .gauge_style(Style::default().fg(Color::Green))
             .use_unicode(true)
             .ratio(trans_progress.min(1.0));
         frame.render_widget(trans_gauge, gauge_rows[2]);
         let trans_line = colored_gauge_label(&trans_label, gauge_rows[2].width, trans_progress);
         let trans_para = Paragraph::new(trans_line).alignment(Alignment::Center);
         frame.render_widget(trans_para, gauge_rows[2]);
+
+        // Minutes gauge (time-to-first-output)
+        let minutes_label = if let Some(note) = minutes_note {
+            format!(
+                "minutes: {:.0}% ({})",
+                (minutes_progress * 100.0).min(100.0),
+                note
+            )
+        } else {
+            format!("minutes: {:.0}%", (minutes_progress * 100.0).min(100.0))
+        };
+        let minutes_gauge = Gauge::default()
+            .gauge_style(Style::default().fg(Color::Rgb(75, 0, 130)))
+            .use_unicode(true)
+            .ratio(minutes_progress.min(1.0));
+        frame.render_widget(minutes_gauge, gauge_rows[3]);
+        let minutes_line = colored_gauge_label(&minutes_label, gauge_rows[3].width, minutes_progress);
+        let minutes_para = Paragraph::new(minutes_line).alignment(Alignment::Center);
+        frame.render_widget(minutes_para, gauge_rows[3]);
 
         // Body: tabs header, content area (URL moved to its own tab)
         let body_constraints = vec![Constraint::Length(3), Constraint::Min(glyph_height as u16)];
@@ -246,16 +268,39 @@ pub fn render(
             Some("Minutes") => *scroll_minutes,
             _ => *scroll_logs,
         };
-        let content_para = Paragraph::new(content_text)
-            .wrap(Wrap { trim: true })
-            .block(content_block)
-            .alignment(Alignment::Left)
-            .style(Style::new().fg(match tabs.get(selected_tab).map(|s| s.as_str()) {
-                Some("URL") => Color::White,
-                Some("Minutes") => Color::White,
-                _ => Color::DarkGray,
-            }))
-            .scroll((y_scroll, 0));
+        // Build paragraph; for Minutes, gray out "Thinking..." blocks
+        let content_para = if tabs.get(selected_tab).map(|s| s.as_str()) == Some("Minutes") {
+            let mut lines_vec: Vec<Line> = Vec::new();
+            let mut thinking = false;
+            for raw in content_text.lines() {
+                let t = raw.trim_start();
+                let lower = t.to_ascii_lowercase();
+                if lower.starts_with("thinking") { thinking = true; }
+                if thinking {
+                    lines_vec.push(Line::from(Span::styled(raw.to_string(), Style::default().fg(Color::DarkGray))));
+                } else {
+                    lines_vec.push(Line::from(Span::styled(raw.to_string(), Style::default().fg(Color::White))));
+                }
+                if lower.starts_with("...done thinking") || lower.starts_with("done thinking") || lower.contains("done thinking") {
+                    thinking = false;
+                }
+            }
+            Paragraph::new(lines_vec)
+                .wrap(Wrap { trim: true })
+                .block(content_block)
+                .alignment(Alignment::Left)
+                .scroll((y_scroll, 0))
+        } else {
+            Paragraph::new(content_text)
+                .wrap(Wrap { trim: true })
+                .block(content_block)
+                .alignment(Alignment::Left)
+                .style(Style::new().fg(match tabs.get(selected_tab).map(|s| s.as_str()) {
+                    Some("URL") => Color::White,
+                    _ => Color::DarkGray,
+                }))
+                .scroll((y_scroll, 0))
+        };
         frame.render_widget(content_para, content_split[0]);
 
         // Scrollbar for the right column

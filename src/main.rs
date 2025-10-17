@@ -44,6 +44,7 @@ enum Stage {
     Download,
     Split,
     Transcribe,
+    Minutes,
 }
 
 enum WorkerMessage {
@@ -88,6 +89,8 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
     let mut split_note: Option<String> = None;
     let mut trans_progress: f64 = 0.0;
     let mut trans_note: Option<String> = None;
+    let mut minutes_progress: f64 = 0.0;
+    let mut minutes_note: Option<String> = None;
     let mut last_tick = Instant::now();
     let tick_rate = Duration::from_millis(120);
     let mut download_status = DownloadStatus::Idle;
@@ -170,6 +173,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                     trans_progress = ratio.clamp(0.0, 1.0);
                                     trans_note = note;
                                 }
+                                Stage::Minutes => {
+                                    minutes_progress = ratio.clamp(0.0, 1.0);
+                                    minutes_note = note;
+                                }
                             }
                         }
                         WorkerMessage::Status(result) => {
@@ -207,6 +214,24 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                             let (mtx, mrx) = mpsc::channel();
                                             let cancel_new = Arc::new(AtomicBool::new(false));
                                             let cancel_clone = Arc::clone(&cancel_new);
+                                            // Progress timer 0->100% in 40s or until first output
+                                            let mtx_timer = mtx.clone();
+                                            thread::spawn(move || {
+                                                let start = Instant::now();
+                                                let total = Duration::from_secs(40);
+                                                loop {
+                                                    let elapsed = start.elapsed();
+                                                    let ratio = (elapsed.as_secs_f64() / total.as_secs_f64()).clamp(0.0, 1.0);
+                                                    let _ = mtx_timer.send(WorkerMessage::StageProgress {
+                                                        stage: Stage::Minutes,
+                                                        ratio,
+                                                        eta: None,
+                                                        note: None,
+                                                    });
+                                                    if ratio >= 1.0 { break; }
+                                                    thread::sleep(Duration::from_millis(500));
+                                                }
+                                            });
                                             thread::spawn(move || {
                                                 // Stream: cat transcript.txt | ollama run minutes
                                                 let path = Path::new("transcript.txt");
@@ -238,6 +263,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                                 if let Some(stdout) = child.stdout.take() {
                                                     let mut reader = BufReader::new(stdout);
                                                     let mut line = String::new();
+                                                    let mut sent_first = false;
                                                     loop {
                                                         if cancel_clone.load(Ordering::SeqCst) {
                                                             let _ = child.kill();
@@ -248,6 +274,16 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                                         match reader.read_line(&mut line) {
                                                             Ok(0) => break,
                                                             Ok(_) => {
+                                                                if !sent_first {
+                                                                    sent_first = true;
+                                                                    // set minutes prog to complete once first output appears
+                                                                    let _ = mtx.send(WorkerMessage::StageProgress {
+                                                                        stage: Stage::Minutes,
+                                                                        ratio: 1.0,
+                                                                        eta: None,
+                                                                        note: Some("streaming".to_string()),
+                                                                    });
+                                                                }
                                                                 let _ = mtx.send(WorkerMessage::MinutesChunk(line.clone()));
                                                             }
                                                             Err(_) => break,
@@ -350,6 +386,8 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                 split_note.as_deref(),
                 trans_progress,
                 trans_note.as_deref(),
+                minutes_progress,
+                minutes_note.as_deref(),
                 &debug_lines,
                 &tabs,
                 selected_tab,
@@ -627,8 +665,7 @@ fn split_audio_to_parts(
     tx: &mpsc::Sender<WorkerMessage>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(), String> {
-    // Remove and recreate the output directory (like `rm -rf parts10 && mkdir parts10`)
-    let _ = fs::remove_dir_all(parts_dir);
+    // Ensure the output directory exists (do not remove to preserve existing transcripts)
     fs::create_dir_all(parts_dir).map_err(|e| e.to_string())?;
 
     // Probe duration in seconds
@@ -815,30 +852,74 @@ fn transcribe_parts_10(
     let progress_vec = Arc::new(Mutex::new(vec![0.0_f64; wavs.len()]));
 
     let total = wavs.len();
+    // Identify parts that already have TXT and can be skipped
+    let mut skip: Vec<bool> = Vec::with_capacity(wavs.len());
+    for path in &wavs {
+        let txt = Path::new(parts_dir)
+            .join(Path::new(path.file_name().unwrap()).with_extension("txt"));
+        // consider only non-empty files as done
+        let done = txt.exists() && fs::metadata(&txt).map(|m| m.len() > 0).unwrap_or(false);
+        skip.push(done);
+    }
+    let done_initial = skip.iter().filter(|b| **b).count();
+    if done_initial == total && total > 0 {
+        // all parts already transcribed; emit 100% and return
+        let _ = tx.send(WorkerMessage::StageProgress {
+            stage: Stage::Transcribe,
+            ratio: 1.0,
+            eta: None,
+            note: Some(format!("{}/{}", total, total)),
+        });
+        let _ = tx.send(WorkerMessage::DownloadLog(
+            "all transcript parts present; skipping transcription".to_string(),
+        ));
+        return Ok(());
+    }
+
+    let to_run: Vec<usize> = (0..wavs.len()).filter(|i| !skip[*i]).collect();
     let _ = tx.send(WorkerMessage::DownloadLog(format!(
         "transcribing {} files with concurrency={}, threads={}",
-        total, concurrency, threads
+        to_run.len(), concurrency, threads
     )));
-    let _ = tx.send(WorkerMessage::StageProgress {
-        stage: Stage::Transcribe,
-        ratio: 0.0,
-        eta: None,
-        note: Some(format!("0/{}", total)),
-    });
+    // Initialize progress vector, mark pre-existing parts complete
+    {
+        if let Ok(mut vec) = progress_vec.lock() {
+            for (i, sk) in skip.iter().enumerate() {
+                vec[i] = if *sk { 1.0 } else { 0.0 };
+            }
+        }
+    }
+    // Emit initial aggregate progress
+    {
+        if let Ok(vec) = progress_vec.lock() {
+            let mut acc = 0.0;
+            for (i, r) in vec.iter().enumerate() {
+                acc += r.clamp(0.0, 1.0) * durations[i];
+            }
+            let agg = (acc / total_duration).clamp(0.0, 1.0);
+            let _ = tx.send(WorkerMessage::StageProgress {
+                stage: Stage::Transcribe,
+                ratio: agg,
+                eta: None,
+                note: Some(format!("{}/{}", done_initial, total)),
+            });
+        }
+    }
 
     // Process in batches up to `concurrency`
+    // Build list of indices to process (skip existing) — already computed above as `to_run`
     let mut idx = 0;
-    let mut completed = 0usize;
-    while idx < wavs.len() {
+    let mut _completed = 0usize; // counts only newly processed parts in this run
+    while idx < to_run.len() {
         if cancel.load(Ordering::SeqCst) {
             return Err("canceled".into());
         }
 
-        let end = (idx + concurrency).min(wavs.len());
+        let end = (idx + concurrency).min(to_run.len());
         let mut handles = Vec::new();
 
-        for path in &wavs[idx..end] {
-            let in_path = path.clone();
+        for i_part in &to_run[idx..end] {
+            let in_path = wavs[*i_part].clone();
             let out_path = Path::new(parts_dir)
                 .join(
                     Path::new(in_path.file_name().unwrap())
@@ -858,7 +939,7 @@ fn transcribe_parts_10(
             let progress_vec_clone = Arc::clone(&progress_vec);
             let durations_clone = durations.clone();
             let total_duration_clone = total_duration;
-            let part_index = wavs.iter().position(|p| p == &in_path).unwrap_or(0);
+            let part_index = *i_part;
 
             handles.push(thread::spawn(move || -> Result<(), String> {
                 if cancel_clone.load(Ordering::SeqCst) {
@@ -976,7 +1057,7 @@ fn transcribe_parts_10(
         for handle in handles {
             match handle.join() {
                 Ok(Ok(())) => {
-                    completed += 1;
+                    _completed += 1;
                     // ratio updates already emitted during progress; still emit a final step tick
                     if let Ok(vec) = progress_vec.lock() {
                         let mut acc = 0.0;
@@ -997,10 +1078,14 @@ fn transcribe_parts_10(
                 Err(_) => return Err("transcription thread panicked".into()),
             }
         }
-        let _ = tx.send(WorkerMessage::DownloadLog(format!(
-            "transcribed {}/{} parts",
-            completed, total
-        )));
+        // Log status including pre-existing done parts
+        if let Ok(vec) = progress_vec.lock() {
+            let done = vec.iter().filter(|r| **r >= 0.999).count();
+            let _ = tx.send(WorkerMessage::DownloadLog(format!(
+                "transcribed {}/{} parts (including pre-existing)",
+                done, total
+            )));
+        }
 
         idx = end;
     }
@@ -1039,29 +1124,3 @@ fn transcribe_parts_10(
     Ok(())
 }
 
-fn generate_minutes(transcript: &str, _max_sentences: usize) -> String {
-    // Prefer local Ollama if available
-    if Command::new("ollama").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().ok().map(|s| s.success()).unwrap_or(false) {
-        if let Ok(mut child) = Command::new("ollama")
-            .args(["run", "minutes"]) // requires `ollama create minutes -f ...`
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = std::io::Write::write_all(&mut stdin, transcript.as_bytes());
-            }
-            if let Ok(out) = child.wait_with_output() {
-                if out.status.success() {
-                    if let Ok(text) = String::from_utf8(out.stdout) {
-                        let trimmed = text.trim().to_string();
-                        if !trimmed.is_empty() { return trimmed; }
-                    }
-                }
-            }
-        }
-    }
-    // Fallback message if Ollama is unavailable or returns no output
-    "Minutes generation requires ollama.\n\nInstall and run ollama, then create the minutes model:\n  ollama serve\n  ollama create minutes -f minutes.model\n\nTo generate minutes manually:\n  ollama run minutes < transcript.txt\n".to_string()
-}
