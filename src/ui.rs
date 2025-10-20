@@ -296,9 +296,9 @@ pub fn render(
         let is_minutes_tab = tabs.get(selected_tab).map(|s| s.as_str()) == Some("Minutes");
         let is_summary_tab = tabs.get(selected_tab).map(|s| s.as_str()) == Some("Summary");
         let rendered_markdown;
-        // If Minutes tab and markdown feature enabled, render Markdown for content after "done thinking"
+        // If Minutes or Summary tab and markdown feature enabled, render Markdown for content after "done thinking"
         #[cfg(feature = "markdown")]
-        if is_minutes_tab {
+        if is_minutes_tab || is_summary_tab {
             // Extract everything after a line containing "done thinking" (case-insensitive)
             let mut after = false;
             let mut post = String::new();
@@ -326,8 +326,8 @@ pub fn render(
         #[cfg(not(feature = "markdown"))]
         { rendered_markdown = false; }
 
-        // Build paragraph; for Minutes, gray out "Thinking..." blocks and render simple Markdown (#, ####, **bold**, **** rule)
-        let content_para = if is_minutes_tab && !rendered_markdown {
+        // Build paragraph; for Minutes and Summary, gray out "Thinking..." blocks and render simple Markdown (#, ####, **bold**, **** rule)
+        let content_para = if (is_minutes_tab || is_summary_tab) && !rendered_markdown {
             let mut lines_vec: Vec<Line> = Vec::new();
             let mut thinking = false;
             let view_width = content_split[0].width.saturating_sub(2); // inner block width approx
@@ -348,13 +348,6 @@ pub fn render(
                 .wrap(Wrap { trim: true })
                 .block(content_block)
                 .alignment(Alignment::Left)
-                .scroll((y_scroll, 0))
-        } else if is_summary_tab {
-            Paragraph::new(content_text)
-                .wrap(Wrap { trim: true })
-                .block(content_block)
-                .alignment(Alignment::Left)
-                .style(Style::new().fg(Color::White))
                 .scroll((y_scroll, 0))
         } else {
             Paragraph::new(content_text)
