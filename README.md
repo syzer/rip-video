@@ -21,6 +21,16 @@ How to use (macOS)
 
 ## Ollama Setup
 
-- Create the minutes model from the repo file:
+- Start the Ollama server:
+  - `ollama serve`
+
+- Pull the model used for Summary (required):
+  - `ollama pull deepseek-r1:14b`
+
+- Create the minutes model from the repo file (required for the Minutes tab):
   - `just create-minutes`
   - or `ollama create minutes -f minutes.model`
+
+- Verify models:
+  - `echo "test" | ollama run minutes`
+  - `echo "test" | ollama run deepseek-r1:14b`

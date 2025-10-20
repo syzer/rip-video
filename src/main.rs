@@ -45,6 +45,7 @@ enum Stage {
     Split,
     Transcribe,
     Minutes,
+    Summary,
 }
 
 enum WorkerMessage {
@@ -56,6 +57,8 @@ enum WorkerMessage {
     DownloadLog(String),
     MinutesChunk(String),
     MinutesDone(Result<(), String>),
+    SummaryChunk(String),
+    SummaryDone(Result<(), String>),
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -91,6 +94,8 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
     let mut trans_note: Option<String> = None;
     let mut minutes_progress: f64 = 0.0;
     let mut minutes_note: Option<String> = None;
+    let mut summary_progress: f64 = 0.0;
+    let mut summary_note: Option<String> = None;
     let mut last_tick = Instant::now();
     let tick_rate = Duration::from_millis(120);
     let mut download_status = DownloadStatus::Idle;
@@ -104,6 +109,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
     let mut selected_tab: usize = 0;
     let mut transcript_text: Option<String> = None;
     let mut minutes_text: Option<String> = None;
+    let mut summary_text: Option<String> = None;
     // Scroll states per tab
     let mut scroll_logs: u16 = 0;
     let mut scroll_trans: u16 = 0;
@@ -176,6 +182,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                 Stage::Minutes => {
                                     minutes_progress = ratio.clamp(0.0, 1.0);
                                     minutes_note = note;
+                                }
+                                Stage::Summary => {
+                                    summary_progress = ratio.clamp(0.0, 1.0);
+                                    summary_note = note;
                                 }
                             }
                         }
@@ -344,19 +354,127 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                             download_rx = None;
                             worker_cancel = None;
                             if res.is_ok() {
-                                // Insert Q/A tab to the left of Minutes and select it
+                                // Ensure Q/A tab exists as the last tab (to the right of Minutes), then select it
+                                // Remove any existing Q/A to avoid duplicates
+                                if let Some(pos) = tabs.iter().position(|t| t == "Q/A") {
+                                    tabs.remove(pos);
+                                }
+                                // Ensure Summary tab sits between Minutes and Q/A
+                                if let Some(pos) = tabs.iter().position(|t| t == "Summary") {
+                                    tabs.remove(pos);
+                                }
                                 if let Some(min_idx) = tabs.iter().position(|t| t == "Minutes") {
-                                    if !tabs.iter().any(|t| t == "Q/A") {
-                                        tabs.insert(min_idx, "Q/A".to_string());
-                                    }
-                                    if let Some(qa_idx) = tabs.iter().position(|t| t == "Q/A") {
-                                        selected_tab = qa_idx;
-                                    }
-                                } else if !tabs.iter().any(|t| t == "Q/A") {
-                                    tabs.push("Q/A".to_string());
-                                    if let Some(qa_idx) = tabs.iter().position(|t| t == "Q/A") {
-                                        selected_tab = qa_idx;
-                                    }
+                                    tabs.insert(min_idx + 1, "Summary".to_string());
+                                }
+                                // Spawn summary generation via ollama deepseek-r1:14b
+                                let ollama_ok = Command::new("ollama")
+                                    .arg("--version")
+                                    .stdin(Stdio::null())
+                                    .stdout(Stdio::null())
+                                    .stderr(Stdio::null())
+                                    .status()
+                                    .ok()
+                                    .map(|s| s.success())
+                                    .unwrap_or(false);
+                                if ollama_ok {
+                                    summary_text = Some(String::new());
+                                    let (stx, srx) = mpsc::channel();
+                                    let cancel_new = Arc::new(AtomicBool::new(false));
+                                    let cancel_clone = Arc::clone(&cancel_new);
+                                    // Start summary warm-up progress timer similar to Minutes (40s)
+                                    let stx_timer = stx.clone();
+                                    thread::spawn(move || {
+                                        let start = Instant::now();
+                                        let total = Duration::from_secs(40);
+                                        loop {
+                                            let ratio = (start.elapsed().as_secs_f64() / total.as_secs_f64()).clamp(0.0, 1.0);
+                                            let _ = stx_timer.send(WorkerMessage::StageProgress {
+                                                stage: Stage::Summary,
+                                                ratio,
+                                                eta: None,
+                                                note: None,
+                                            });
+                                            if ratio >= 1.0 { break; }
+                                            thread::sleep(Duration::from_millis(500));
+                                        }
+                                    });
+                                    thread::spawn(move || {
+                                        let transcript = match fs::read_to_string("transcript.txt") {
+                                            Ok(s) => s,
+                                            Err(e) => {
+                                                let _ = stx.send(WorkerMessage::SummaryDone(Err(e.to_string())));
+                                                return;
+                                            }
+                                        };
+                                        let prompt = format!(
+                                            "Make a summary of this transcript:\n{}",
+                                            transcript
+                                        );
+                                        let mut child = match Command::new("ollama")
+                                            .args(["run", "deepseek-r1:14b", &prompt])
+                                            .stdin(Stdio::null())
+                                            .stdout(Stdio::piped())
+                                            .stderr(Stdio::piped())
+                                            .spawn()
+                                        {
+                                            Ok(c) => c,
+                                            Err(e) => {
+                                                let _ = stx.send(WorkerMessage::SummaryDone(Err(e.to_string())));
+                                                return;
+                                            }
+                                        };
+                                        if let Some(stdout) = child.stdout.take() {
+                                            let mut reader = BufReader::new(stdout);
+                                            let mut line = String::new();
+                                            let mut first = true;
+                                            loop {
+                                                if cancel_clone.load(Ordering::SeqCst) {
+                                                    let _ = child.kill();
+                                                    let _ = stx.send(WorkerMessage::SummaryDone(Err("canceled".into())));
+                                                    return;
+                                                }
+                                                line.clear();
+                                                match reader.read_line(&mut line) {
+                                                    Ok(0) => break,
+                                                    Ok(_) => {
+                                                        if first {
+                                                            first = false;
+                                                            let _ = stx.send(WorkerMessage::StageProgress {
+                                                                stage: Stage::Summary,
+                                                                ratio: 1.0,
+                                                                eta: None,
+                                                                note: Some("streaming".to_string()),
+                                                            });
+                                                        }
+                                                        let _ = stx.send(WorkerMessage::SummaryChunk(line.clone()));
+                                                    }
+                                                    Err(_) => break,
+                                                }
+                                            }
+                                        }
+                                        match child.wait() {
+                                            Ok(status) if status.success() => {
+                                                let _ = stx.send(WorkerMessage::SummaryDone(Ok(())));
+                                            }
+                                            Ok(status) => {
+                                                let code = status.code().map(|c| c.to_string()).unwrap_or_else(|| "terminated by signal".to_string());
+                                                let _ = stx.send(WorkerMessage::SummaryDone(Err(format!("ollama exit {code}"))));
+                                            }
+                                            Err(e) => {
+                                                let _ = stx.send(WorkerMessage::SummaryDone(Err(e.to_string())));
+                                            }
+                                        }
+                                    });
+                                    download_rx = Some(srx);
+                                    worker_cancel = Some(cancel_new);
+                                } else {
+                                    summary_text = Some(
+                                        "Summary generation requires ollama.\n\nInstall and run ollama:\n  ollama serve\n  ollama pull deepseek-r1:14b\nThen rerun the app.".to_string(),
+                                    );
+                                }
+                                tabs.push("Q/A".to_string());
+                                if let Some(qa_idx) = tabs.iter().position(|t| t == "Q/A") {
+                                    selected_tab = qa_idx;
                                 }
                             }
                         }
@@ -366,6 +484,16 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                 let overflow = debug_lines.len() - DEBUG_MAX_LINES;
                                 debug_lines.drain(0..overflow);
                             }
+                        }
+                        WorkerMessage::SummaryChunk(chunk) => {
+                            match summary_text.as_mut() {
+                                Some(s) => s.push_str(&chunk),
+                                None => summary_text = Some(chunk),
+                            }
+                        }
+                        WorkerMessage::SummaryDone(_res) => {
+                            download_rx = None;
+                            worker_cancel = None;
                         }
                     }
                 }
@@ -404,11 +532,14 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                 trans_note.as_deref(),
                 minutes_progress,
                 minutes_note.as_deref(),
+                summary_progress,
+                summary_note.as_deref(),
                 &debug_lines,
                 &tabs,
                 selected_tab,
                 transcript_text.as_deref(),
                 minutes_text.as_deref(),
+                summary_text.as_deref(),
                 &mut scroll_logs,
                 &mut scroll_trans,
                 &mut scroll_minutes,
@@ -805,7 +936,7 @@ fn probe_duration_seconds(input_path: &str) -> Result<f64, String> {
     ];
 
     let output = Command::new("ffprobe")
-        .args(&args)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -991,25 +1122,25 @@ fn transcribe_parts_10(
                             Ok(0) => break,
                             Ok(_) => {
                                 let t = line.trim();
-                                if let Some(val) = t.strip_prefix("out_time_us=") {
-                                    if let Ok(us) = val.parse::<u64>() {
-                                        let ratio = (us as f64 / 1_000_000.0) / part_duration;
-                                        if let Ok(mut vec) = progress_vec_clone.lock() {
-                                            vec[part_index] = ratio.clamp(0.0, 1.0);
-                                            // aggregate weighted ratio
-                                            let mut acc = 0.0;
-                                            for (i, r) in vec.iter().enumerate() {
-                                                acc += r.clamp(0.0, 1.0) * durations_clone[i];
-                                            }
-                                            let agg = (acc / total_duration_clone).clamp(0.0, 1.0);
-                                            let done = vec.iter().filter(|r| **r >= 0.999).count();
-                                            let _ = tx_clone.send(WorkerMessage::StageProgress {
-                                                stage: Stage::Transcribe,
-                                                ratio: agg,
-                                                eta: None,
-                                                note: Some(format!("{}/{}", done, durations_clone.len())),
-                                            });
+                                if let Some(val) = t.strip_prefix("out_time_us=")
+                                    && let Ok(us) = val.parse::<u64>()
+                                {
+                                    let ratio = (us as f64 / 1_000_000.0) / part_duration;
+                                    if let Ok(mut vec) = progress_vec_clone.lock() {
+                                        vec[part_index] = ratio.clamp(0.0, 1.0);
+                                        // aggregate weighted ratio
+                                        let mut acc = 0.0;
+                                        for (i, r) in vec.iter().enumerate() {
+                                            acc += r.clamp(0.0, 1.0) * durations_clone[i];
                                         }
+                                        let agg = (acc / total_duration_clone).clamp(0.0, 1.0);
+                                        let done = vec.iter().filter(|r| **r >= 0.999).count();
+                                        let _ = tx_clone.send(WorkerMessage::StageProgress {
+                                            stage: Stage::Transcribe,
+                                            ratio: agg,
+                                            eta: None,
+                                            note: Some(format!("{}/{}", done, durations_clone.len())),
+                                        });
                                     }
                                 }
                                 if t == "progress=end" {

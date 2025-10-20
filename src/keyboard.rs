@@ -52,15 +52,21 @@ pub fn handle_key(
         },
         KeyCode::Down => match tabs.get(*selected_tab).map(|s| s.as_str()) {
             Some("Transcription") => {
-                let max = trans_lines_count.saturating_sub(last_viewport_lines);
+                let max = trans_lines_count
+                    .saturating_sub(last_viewport_lines)
+                    .saturating_add(last_viewport_lines);
                 if *scroll_trans < max { *scroll_trans += 1; }
             }
             Some("Minutes") => {
-                let max = minutes_lines_count.saturating_sub(last_viewport_lines);
+                let max = minutes_lines_count
+                    .saturating_sub(last_viewport_lines)
+                    .saturating_add(last_viewport_lines);
                 if *scroll_minutes < max { *scroll_minutes += 1; }
             }
             _ => {
-                let max = logs_lines_count.saturating_sub(last_viewport_lines);
+                let max = logs_lines_count
+                    .saturating_sub(last_viewport_lines)
+                    .saturating_add(last_viewport_lines);
                 if *scroll_logs < max { *scroll_logs += 1; }
             }
         },
@@ -76,15 +82,21 @@ pub fn handle_key(
             let step = last_viewport_lines.max(1);
             match tabs.get(*selected_tab).map(|s| s.as_str()) {
                 Some("Transcription") => {
-                    let max = trans_lines_count.saturating_sub(last_viewport_lines);
+                    let max = trans_lines_count
+                        .saturating_sub(last_viewport_lines)
+                        .saturating_add(last_viewport_lines);
                     *scroll_trans = (*scroll_trans + step).min(max);
                 }
                 Some("Minutes") => {
-                    let max = minutes_lines_count.saturating_sub(last_viewport_lines);
+                    let max = minutes_lines_count
+                        .saturating_sub(last_viewport_lines)
+                        .saturating_add(last_viewport_lines);
                     *scroll_minutes = (*scroll_minutes + step).min(max);
                 }
                 _ => {
-                    let max = logs_lines_count.saturating_sub(last_viewport_lines);
+                    let max = logs_lines_count
+                        .saturating_sub(last_viewport_lines)
+                        .saturating_add(last_viewport_lines);
                     *scroll_logs = (*scroll_logs + step).min(max);
                 }
             }
@@ -96,13 +108,19 @@ pub fn handle_key(
         },
         KeyCode::End => match tabs.get(*selected_tab).map(|s| s.as_str()) {
             Some("Transcription") => {
-                *scroll_trans = trans_lines_count.saturating_sub(last_viewport_lines);
+                *scroll_trans = trans_lines_count
+                    .saturating_sub(last_viewport_lines)
+                    .saturating_add(last_viewport_lines);
             }
             Some("Minutes") => {
-                *scroll_minutes = minutes_lines_count.saturating_sub(last_viewport_lines);
+                *scroll_minutes = minutes_lines_count
+                    .saturating_sub(last_viewport_lines)
+                    .saturating_add(last_viewport_lines);
             }
             _ => {
-                *scroll_logs = logs_lines_count.saturating_sub(last_viewport_lines);
+                *scroll_logs = logs_lines_count
+                    .saturating_sub(last_viewport_lines)
+                    .saturating_add(last_viewport_lines);
             }
         },
         _ => {}

@@ -27,11 +27,14 @@ pub fn render(
     trans_note: Option<&str>,
     minutes_progress: f64,
     minutes_note: Option<&str>,
+    summary_progress: f64,
+    summary_note: Option<&str>,
     debug_lines: &[String],
     tabs: &[String],
     selected_tab: usize,
     transcript_text: Option<&str>,
     minutes_text: Option<&str>,
+    summary_text: Option<&str>,
     scroll_logs: &mut u16,
     scroll_trans: &mut u16,
     scroll_minutes: &mut u16,
@@ -60,7 +63,7 @@ pub fn render(
         vec![
             Constraint::Length(glyph_height as u16),
             Constraint::Length(status_height),
-            Constraint::Length(4),
+            Constraint::Length(5),
             Constraint::Min(glyph_height as u16),
             Constraint::Length(1), // footer
         ]
@@ -94,10 +97,11 @@ pub fn render(
         let gauge_area = sections[2];
         let body_area = sections[3];
 
-        // Split gauge_area into four single-line rows
+        // Split gauge_area into five single-line rows
         let gauge_rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
+                Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Length(1),
@@ -157,9 +161,25 @@ pub fn render(
         };
         let minutes_gauge = LineGauge::default()
             .label(minutes_label)
-            .gauge_style(Style::default().fg(Color::Rgb(75, 0, 130)))
+            .gauge_style(Style::default().fg(Color::Rgb(64, 224, 208)))
             .ratio(minutes_progress.min(1.0));
         frame.render_widget(minutes_gauge, gauge_rows[3]);
+
+        // Summary gauge (warm-up while generating summary)
+        let summary_label = if let Some(note) = summary_note {
+            format!(
+                "summary: {:.0}% ({})",
+                (summary_progress * 100.0).min(100.0),
+                note
+            )
+        } else {
+            format!("summary: {:.0}%", (summary_progress * 100.0).min(100.0))
+        };
+        let summary_gauge = LineGauge::default()
+            .label(summary_label)
+            .gauge_style(Style::default().fg(Color::Rgb(238, 130, 238)))
+            .ratio(summary_progress.min(1.0));
+        frame.render_widget(summary_gauge, gauge_rows[4]);
 
         // Body: tabs header, content area (URL moved to its own tab)
         let body_constraints = vec![Constraint::Length(3), Constraint::Min(glyph_height as u16)];
@@ -212,6 +232,10 @@ pub fn render(
                 "Minutes",
                 minutes_text.unwrap_or("(minutes not generated)").to_string(),
             ),
+            Some("Summary") => (
+                "Summary",
+                summary_text.unwrap_or("(no summary yet)\n\nMake sure Ollama is installed and minutes completed.").to_string(),
+            ),
             Some("Q/A") => (
                 "Q/A",
                 "Q/A tab\n\nThis is a placeholder. Ask questions about the minutes here.".to_string(),
@@ -233,25 +257,32 @@ pub fn render(
         let inner_width = content_split[0].width.saturating_sub(2);
         let lines_count = wrapped_lines_count(&content_text, inner_width);
         *last_viewport_lines = inner_height;
+        let fudge = inner_height.max(5);
         match tabs.get(selected_tab).map(|s| s.as_str()) {
             Some("Transcription") => {
                 *trans_lines_count = lines_count;
                 if *trans_lines_count > inner_height {
-                    let max_scroll = *trans_lines_count - inner_height;
+                    let max_scroll = trans_lines_count
+                        .saturating_sub(inner_height)
+                        .saturating_add(fudge);
                     if *scroll_trans > max_scroll { *scroll_trans = max_scroll; }
                 } else { *scroll_trans = 0; }
             }
             Some("Minutes") => {
                 *minutes_lines_count = lines_count;
                 if *minutes_lines_count > inner_height {
-                    let max_scroll = *minutes_lines_count - inner_height;
+                    let max_scroll = minutes_lines_count
+                        .saturating_sub(inner_height)
+                        .saturating_add(fudge);
                     if *scroll_minutes > max_scroll { *scroll_minutes = max_scroll; }
                 } else { *scroll_minutes = 0; }
             }
             _ => {
                 *logs_lines_count = lines_count;
                 if *logs_lines_count > inner_height {
-                    let max_scroll = *logs_lines_count - inner_height;
+                    let max_scroll = logs_lines_count
+                        .saturating_sub(inner_height)
+                        .saturating_add(fudge);
                     if *scroll_logs > max_scroll { *scroll_logs = max_scroll; }
                 } else { *scroll_logs = 0; }
             }
@@ -263,6 +294,7 @@ pub fn render(
             _ => *scroll_logs,
         };
         let is_minutes_tab = tabs.get(selected_tab).map(|s| s.as_str()) == Some("Minutes");
+        let is_summary_tab = tabs.get(selected_tab).map(|s| s.as_str()) == Some("Summary");
         let rendered_markdown;
         // If Minutes tab and markdown feature enabled, render Markdown for content after "done thinking"
         #[cfg(feature = "markdown")]
@@ -280,7 +312,13 @@ pub fn render(
                 }
             }
             if !post.trim().is_empty() {
-                let md = Markdown::new(post.as_str());
+                // emulate vertical scroll by slicing lines window
+                let lines: Vec<&str> = post.lines().collect();
+                lines_count = lines.len() as u16;
+                let start = (y_scroll as usize).min(lines.len());
+                let end = (start + inner_height as usize).min(lines.len());
+                let visible = if start < end { lines[start..end].join("\n") } else { String::new() };
+                let md = Markdown::new(visible.as_str());
                 frame.render_widget(md, content_split[0]);
                 rendered_markdown = true;
             }
@@ -310,6 +348,13 @@ pub fn render(
                 .wrap(Wrap { trim: true })
                 .block(content_block)
                 .alignment(Alignment::Left)
+                .scroll((y_scroll, 0))
+        } else if is_summary_tab {
+            Paragraph::new(content_text)
+                .wrap(Wrap { trim: true })
+                .block(content_block)
+                .alignment(Alignment::Left)
+                .style(Style::new().fg(Color::White))
                 .scroll((y_scroll, 0))
         } else {
             Paragraph::new(content_text)
