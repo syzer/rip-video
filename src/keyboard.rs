@@ -1,8 +1,9 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
+#[allow(clippy::too_many_arguments)]
 pub fn handle_key(
     key: &KeyEvent,
-    tabs: &Vec<String>,
+    tabs: &[String],
     selected_tab: &mut usize,
     scroll_logs: &mut u16,
     scroll_trans: &mut u16,

@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, Paragraph, Tabs, Wrap, Scrollbar, ScrollbarState},
+    widgets::{Block, Borders, LineGauge, Paragraph, Tabs, Wrap, Scrollbar, ScrollbarState},
     Frame,
 };
 #[cfg(feature = "markdown")]
@@ -27,8 +27,8 @@ pub fn render(
     trans_note: Option<&str>,
     minutes_progress: f64,
     minutes_note: Option<&str>,
-    debug_lines: &Vec<String>,
-    tabs: &Vec<String>,
+    debug_lines: &[String],
+    tabs: &[String],
     selected_tab: usize,
     transcript_text: Option<&str>,
     minutes_text: Option<&str>,
@@ -60,7 +60,7 @@ pub fn render(
         vec![
             Constraint::Length(glyph_height as u16),
             Constraint::Length(status_height),
-            Constraint::Length(8),
+            Constraint::Length(4),
             Constraint::Min(glyph_height as u16),
             Constraint::Length(1), // footer
         ]
@@ -94,14 +94,14 @@ pub fn render(
         let gauge_area = sections[2];
         let body_area = sections[3];
 
-        // Split gauge_area into four rows for the pipeline stages
+        // Split gauge_area into four single-line rows
         let gauge_rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(2),
-                Constraint::Length(2),
-                Constraint::Length(2),
-                Constraint::Length(2),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
             ])
             .split(gauge_area);
 
@@ -111,14 +111,11 @@ pub fn render(
         } else {
             format!("dl: {:.0}%", (progress * 100.0).min(100.0))
         };
-        let dl_gauge = Gauge::default()
+        let dl_gauge = LineGauge::default()
+            .label(dl_label)
             .gauge_style(Style::default().fg(Color::Red))
-            .use_unicode(true)
             .ratio(progress.min(1.0));
         frame.render_widget(dl_gauge, gauge_rows[0]);
-        let dl_line = colored_gauge_label(&dl_label, gauge_rows[0].width, progress);
-        let dl_para = Paragraph::new(dl_line).alignment(Alignment::Center);
-        frame.render_widget(dl_para, gauge_rows[0]);
 
         // Split gauge
         let split_label = if let Some(note) = split_note {
@@ -126,14 +123,11 @@ pub fn render(
         } else {
             format!("split: {:.0}%", (split_progress * 100.0).min(100.0))
         };
-        let split_gauge = Gauge::default()
+        let split_gauge = LineGauge::default()
+            .label(split_label)
             .gauge_style(Style::default().fg(Color::Yellow))
-            .use_unicode(true)
             .ratio(split_progress.min(1.0));
         frame.render_widget(split_gauge, gauge_rows[1]);
-        let split_line = colored_gauge_label(&split_label, gauge_rows[1].width, split_progress);
-        let split_para = Paragraph::new(split_line).alignment(Alignment::Center);
-        frame.render_widget(split_para, gauge_rows[1]);
 
         // Transcribe gauge
         let trans_label = if let Some(note) = trans_note {
@@ -145,14 +139,11 @@ pub fn render(
         } else {
             format!("transcribe: {:.0}%", (trans_progress * 100.0).min(100.0))
         };
-        let trans_gauge = Gauge::default()
+        let trans_gauge = LineGauge::default()
+            .label(trans_label)
             .gauge_style(Style::default().fg(Color::Green))
-            .use_unicode(true)
             .ratio(trans_progress.min(1.0));
         frame.render_widget(trans_gauge, gauge_rows[2]);
-        let trans_line = colored_gauge_label(&trans_label, gauge_rows[2].width, trans_progress);
-        let trans_para = Paragraph::new(trans_line).alignment(Alignment::Center);
-        frame.render_widget(trans_para, gauge_rows[2]);
 
         // Minutes gauge (time-to-first-output)
         let minutes_label = if let Some(note) = minutes_note {
@@ -164,14 +155,11 @@ pub fn render(
         } else {
             format!("minutes: {:.0}%", (minutes_progress * 100.0).min(100.0))
         };
-        let minutes_gauge = Gauge::default()
+        let minutes_gauge = LineGauge::default()
+            .label(minutes_label)
             .gauge_style(Style::default().fg(Color::Rgb(75, 0, 130)))
-            .use_unicode(true)
             .ratio(minutes_progress.min(1.0));
         frame.render_widget(minutes_gauge, gauge_rows[3]);
-        let minutes_line = colored_gauge_label(&minutes_label, gauge_rows[3].width, minutes_progress);
-        let minutes_para = Paragraph::new(minutes_line).alignment(Alignment::Center);
-        frame.render_widget(minutes_para, gauge_rows[3]);
 
         // Body: tabs header, content area (URL moved to its own tab)
         let body_constraints = vec![Constraint::Length(3), Constraint::Min(glyph_height as u16)];
@@ -223,6 +211,10 @@ pub fn render(
             Some("Minutes") => (
                 "Minutes",
                 minutes_text.unwrap_or("(minutes not generated)").to_string(),
+            ),
+            Some("Q/A") => (
+                "Q/A",
+                "Q/A tab\n\nThis is a placeholder. Ask questions about the minutes here.".to_string(),
             ),
             _ => ("Logs", debug_lines.join("\n")),
         };
@@ -374,42 +366,13 @@ fn wrapped_lines_count(text: &str, inner_width: u16) -> u16 {
     let mut total: u16 = 0;
     for line in text.lines() {
         let len = line.chars().count();
-        let chunks = ((len + w - 1) / w).max(1);
+        let chunks = len.div_ceil(w).max(1);
         total = total.saturating_add(chunks as u16);
     }
     if total == 0 { 1 } else { total }
 }
 
-fn colored_gauge_label(label: &str, row_width: u16, ratio: f64) -> Line<'static> {
-    let label_chars: Vec<char> = label.chars().collect();
-    let label_len = label_chars.len() as u16;
-    let width = row_width;
-    let start_col = width.saturating_sub(label_len) / 2; // centered start
-    let fill_cols = (ratio.max(0.0).min(1.0) * (width as f64)).floor() as u16;
-
-    let overlap = if fill_cols > start_col {
-        (fill_cols - start_col).min(label_len)
-    } else {
-        0
-    } as usize;
-
-    let (left, right) = if overlap > 0 {
-        let left: String = label_chars.iter().take(overlap).collect();
-        let right: String = label_chars.iter().skip(overlap).collect();
-        (left, right)
-    } else {
-        (String::new(), label.to_string())
-    };
-
-    let mut spans: Vec<Span> = Vec::new();
-    if !left.is_empty() {
-        spans.push(Span::styled(left, Style::default().fg(Color::White).bg(Color::Black)));
-    }
-    if !right.is_empty() {
-        spans.push(Span::styled(right, Style::default().fg(Color::White)));
-    }
-    Line::from(spans)
-}
+// removed colored_gauge_label; using LineGauge labels directly
 
 fn render_simple_markdown_line(raw: &str, width: u16) -> Line<'static> {
     let t = raw.trim_end();

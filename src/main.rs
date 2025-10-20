@@ -340,9 +340,25 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                                 None => minutes_text = Some(chunk),
                             }
                         }
-                        WorkerMessage::MinutesDone(_res) => {
+                        WorkerMessage::MinutesDone(res) => {
                             download_rx = None;
                             worker_cancel = None;
+                            if res.is_ok() {
+                                // Insert Q/A tab to the left of Minutes and select it
+                                if let Some(min_idx) = tabs.iter().position(|t| t == "Minutes") {
+                                    if !tabs.iter().any(|t| t == "Q/A") {
+                                        tabs.insert(min_idx, "Q/A".to_string());
+                                    }
+                                    if let Some(qa_idx) = tabs.iter().position(|t| t == "Q/A") {
+                                        selected_tab = qa_idx;
+                                    }
+                                } else if !tabs.iter().any(|t| t == "Q/A") {
+                                    tabs.push("Q/A".to_string());
+                                    if let Some(qa_idx) = tabs.iter().position(|t| t == "Q/A") {
+                                        selected_tab = qa_idx;
+                                    }
+                                }
+                            }
                         }
                         WorkerMessage::DownloadLog(line) => {
                             debug_lines.push(line);
@@ -405,8 +421,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
             );
         })?;
 
-        if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
+        if event::poll(Duration::from_millis(200))? && let Event::Key(key) = event::read()? {
                 let should_exit = keyboard::handle_key(
                     &key,
                     &tabs,
@@ -425,7 +440,6 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
                     }
                     break;
                 }
-            }
         }
     }
 
@@ -501,7 +515,7 @@ fn download_worker(
     });
 
     let mut command = Command::new("yt-dlp");
-    command.args(&args);
+    command.args(args);
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
@@ -980,23 +994,21 @@ fn transcribe_parts_10(
                                 if let Some(val) = t.strip_prefix("out_time_us=") {
                                     if let Ok(us) = val.parse::<u64>() {
                                         let ratio = (us as f64 / 1_000_000.0) / part_duration;
-                                        {
-                                            if let Ok(mut vec) = progress_vec_clone.lock() {
-                                                vec[part_index] = ratio.clamp(0.0, 1.0);
-                                                // aggregate weighted ratio
-                                                let mut acc = 0.0;
-                                                for (i, r) in vec.iter().enumerate() {
-                                                    acc += r.clamp(0.0, 1.0) * durations_clone[i];
-                                                }
-                                                let agg = (acc / total_duration_clone).clamp(0.0, 1.0);
-                                                let done = vec.iter().filter(|r| **r >= 0.999).count();
-                                                let _ = tx_clone.send(WorkerMessage::StageProgress {
-                                                    stage: Stage::Transcribe,
-                                                    ratio: agg,
-                                                    eta: None,
-                                                    note: Some(format!("{}/{}", done, durations_clone.len())),
-                                                });
+                                        if let Ok(mut vec) = progress_vec_clone.lock() {
+                                            vec[part_index] = ratio.clamp(0.0, 1.0);
+                                            // aggregate weighted ratio
+                                            let mut acc = 0.0;
+                                            for (i, r) in vec.iter().enumerate() {
+                                                acc += r.clamp(0.0, 1.0) * durations_clone[i];
                                             }
+                                            let agg = (acc / total_duration_clone).clamp(0.0, 1.0);
+                                            let done = vec.iter().filter(|r| **r >= 0.999).count();
+                                            let _ = tx_clone.send(WorkerMessage::StageProgress {
+                                                stage: Stage::Transcribe,
+                                                ratio: agg,
+                                                eta: None,
+                                                note: Some(format!("{}/{}", done, durations_clone.len())),
+                                            });
                                         }
                                     }
                                 }
@@ -1123,4 +1135,3 @@ fn transcribe_parts_10(
     ));
     Ok(())
 }
-
