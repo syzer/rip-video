@@ -387,21 +387,23 @@ pub fn render(
             .alignment(Alignment::Center)
             .style(Style::new().fg(Color::DarkGray));
         frame.render_widget(footer, footer_area);
-    } else {
-        let body_area = sections[2];
-        let hint = Paragraph::new(
-            "go to chrome terminal, find a url for `videomanifest`, and copy a URL",
-        )
-        .alignment(Alignment::Center)
-        .style(Style::new().fg(Color::Red));
-        frame.render_widget(hint, body_area);
-        // Footer hint
-        let footer_area = sections[3];
-        let footer = Paragraph::new("← → tabs • ↑ ↓ scroll • t=Transcription • m=Minutes • q=Exit")
-            .alignment(Alignment::Center)
-            .style(Style::new().fg(Color::DarkGray));
-        frame.render_widget(footer, footer_area);
+        return;
     }
+
+    // No valid link: early return after drawing hint
+    let body_area = sections[2];
+    let hint = Paragraph::new(
+        "go to chrome terminal, find a url for `videomanifest`, and copy a URL",
+    )
+    .alignment(Alignment::Center)
+    .style(Style::new().fg(Color::Red));
+    frame.render_widget(hint, body_area);
+    // Footer hint
+    let footer_area = sections[3];
+    let footer = Paragraph::new("← → tabs • ↑ ↓ scroll • t=Transcription • m=Minutes • q=Exit")
+        .alignment(Alignment::Center)
+        .style(Style::new().fg(Color::DarkGray));
+    frame.render_widget(footer, footer_area);
 }
 
 // Removed unused chunk_text_to_width; wrapped_lines_count is used instead
