@@ -52,7 +52,7 @@ pub fn render(
         .constraints([Constraint::Min(glyph_height as u16 + 6)].as_ref())
         .split(area);
 
-    let block = Block::default().title("Message").borders(Borders::ALL);
+    let block = Block::default().title("Rip Video").borders(Borders::ALL);
     let inner = block.inner(centered[0]);
     frame.render_widget(block, centered[0]);
 

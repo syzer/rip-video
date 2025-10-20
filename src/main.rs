@@ -48,8 +48,6 @@ pub(crate) enum Stage {
 }
 
 pub(crate) enum WorkerMessage {
-    // Legacy download progress
-    Progress { ratio: f64, eta: Option<String> },
     // Stage-aware progress for multi-phase pipeline
     StageProgress { stage: Stage, ratio: f64, eta: Option<String>, note: Option<String> },
     Status(Result<(), String>),
@@ -120,210 +118,35 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
     let mut last_viewport_lines: u16 = 0;
 
     loop {
-        if has_valid_link {
-            if matches!(download_status, DownloadStatus::Idle) {
-                let (tx, rx) = mpsc::channel();
-                let cancel_flag = Arc::new(AtomicBool::new(false));
-                let cancel_for_thread = Arc::clone(&cancel_flag);
-
-                let download_link = download_url.clone();
-                let output_target_clone = output_target.clone();
-                thread::spawn(move || {
-                    worker::download::download_worker(
-                        download_link,
-                        output_target_clone,
-                        tx,
-                        cancel_for_thread,
-                    )
-                });
-
-                download_rx = Some(rx);
-                download_status = DownloadStatus::Running;
-                progress = 0.0;
-                progress_synced = false;
-                last_tick = Instant::now();
-                worker_cancel = Some(cancel_flag);
-                debug_lines.clear();
-                eta_text = None;
-            }
-
-            if let Some(rx) = download_rx.as_ref() {
-                let mut messages = Vec::new();
-                let mut disconnected = false;
-                loop {
-                    match rx.try_recv() {
-                        Ok(message) => messages.push(message),
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => {
-                            disconnected = true;
-                            break;
-                        }
-                    }
-                }
-
-                for message in messages {
-                    match message {
-                        WorkerMessage::Progress { ratio, eta } => {
-                            progress = ratio.clamp(0.0, 1.0);
-                            progress_synced = true;
-                            eta_text = eta;
-                        }
-                        WorkerMessage::StageProgress { stage, ratio, eta, note } => {
-                            match stage {
-                                Stage::Download => {
-                                    progress = ratio.clamp(0.0, 1.0);
-                                    progress_synced = true;
-                                    eta_text = eta;
-                                }
-                                Stage::Split => {
-                                    split_progress = ratio.clamp(0.0, 1.0);
-                                    split_note = note;
-                                }
-                                Stage::Transcribe => {
-                                    trans_progress = ratio.clamp(0.0, 1.0);
-                                    trans_note = note;
-                                }
-                                Stage::Minutes => {
-                                    minutes_progress = ratio.clamp(0.0, 1.0);
-                                    minutes_note = note;
-                                }
-                                Stage::Summary => {
-                                    summary_progress = ratio.clamp(0.0, 1.0);
-                                    summary_note = note;
-                                }
-                            }
-                        }
-                        WorkerMessage::Status(result) => {
-                            download_rx = None;
-                            worker_cancel = None;
-                            match result {
-                                Ok(()) => {
-                                    progress = 1.0;
-                                    split_progress = 1.0;
-                                    trans_progress = 1.0;
-                                    download_status = DownloadStatus::Success;
-                                    download_error = None;
-                                    eta_text = None;
-                                    // After full pipeline success: load transcript; spawn minutes stream via ollama if available
-                                    if fs::metadata("transcript.txt").is_ok() {
-                                        transcript_text = fs::read_to_string("transcript.txt").ok();
-                                        if !tabs.iter().any(|t| t == "Transcription") {
-                                            tabs.push("Transcription".to_string());
-                                        }
-                                        if !tabs.iter().any(|t| t == "Minutes") {
-                                            tabs.push("Minutes".to_string());
-                                        }
-                                        match worker::minutes::start_minutes_worker() {
-                                            Ok((mrx, cancel_new)) => {
-                                                // Start minutes streaming thread
-                                                minutes_text = Some(String::new());
-                                                download_rx = Some(mrx);
-                                                worker_cancel = Some(cancel_new);
-                                                // Focus minutes tab to watch streaming
-                                                if let Some(idx) = tabs.iter().position(|t| t == "Minutes") {
-                                                    selected_tab = idx;
-                                                }
-                                                // Reset scroll for minutes
-                                                scroll_minutes = 0;
-                                            }
-                                            Err(msg) => {
-                                                // Show requirement message if ollama missing
-                                                minutes_text = Some(msg);
-                                                if let Some(idx) = tabs.iter().position(|t| t == "Minutes") {
-                                                    selected_tab = idx;
-                                                }
-                                                scroll_minutes = 0;
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    progress = 0.0;
-                                    split_progress = 0.0;
-                                    trans_progress = 0.0;
-                                    download_status = DownloadStatus::Failed;
-                                    download_error = Some(err);
-                                    eta_text = None;
-                                }
-                            }
-                        }
-                        WorkerMessage::MinutesChunk(chunk) => {
-                            match minutes_text.as_mut() {
-                                Some(s) => s.push_str(&chunk),
-                                None => minutes_text = Some(chunk),
-                            }
-                        }
-                        WorkerMessage::MinutesDone(res) => {
-                            download_rx = None;
-                            worker_cancel = None;
-                            if res.is_ok() {
-                                // Ensure Q/A tab exists as the last tab (to the right of Minutes), then select it
-                                // Remove any existing Q/A to avoid duplicates
-                                if let Some(pos) = tabs.iter().position(|t| t == "Q/A") {
-                                    tabs.remove(pos);
-                                }
-                                // Ensure Summary tab sits between Minutes and Q/A
-                                if let Some(pos) = tabs.iter().position(|t| t == "Summary") {
-                                    tabs.remove(pos);
-                                }
-                                if let Some(min_idx) = tabs.iter().position(|t| t == "Minutes") {
-                                    tabs.insert(min_idx + 1, "Summary".to_string());
-                                }
-                                // Start summary worker
-                                match worker::summary::start_summary_worker() {
-                                    Ok((srx, cancel_new)) => {
-                                        summary_text = Some(String::new());
-                                        download_rx = Some(srx);
-                                        worker_cancel = Some(cancel_new);
-                                    }
-                                    Err(msg) => {
-                                        summary_text = Some(msg);
-                                    }
-                                }
-                                
-                                tabs.push("Q/A".to_string());
-                                if let Some(qa_idx) = tabs.iter().position(|t| t == "Q/A") {
-                                    selected_tab = qa_idx;
-                                }
-                            }
-                        }
-                        WorkerMessage::DownloadLog(line) => {
-                            debug_lines.push(line);
-                            if debug_lines.len() > DEBUG_MAX_LINES {
-                                let overflow = debug_lines.len() - DEBUG_MAX_LINES;
-                                debug_lines.drain(0..overflow);
-                            }
-                        }
-                        WorkerMessage::SummaryChunk(chunk) => {
-                            match summary_text.as_mut() {
-                                Some(s) => s.push_str(&chunk),
-                                None => summary_text = Some(chunk),
-                            }
-                        }
-                        WorkerMessage::SummaryDone(_res) => {
-                            download_rx = None;
-                            worker_cancel = None;
-                        }
-                    }
-                }
-
-                if disconnected && matches!(download_status, DownloadStatus::Running) {
-                    download_rx = None;
-                    worker_cancel = None;
-                    download_status = DownloadStatus::Failed;
-                    download_error = Some("downloader process disconnected".to_string());
-                    eta_text = None;
-                }
-            }
-
-            if matches!(download_status, DownloadStatus::Running)
-                && !progress_synced
-                && last_tick.elapsed() >= tick_rate
-            {
-                progress = (progress + 0.02) % 1.0;
-                last_tick = Instant::now();
-            }
-        }
+        handle_download_tick(
+            has_valid_link,
+            &download_url,
+            &output_target,
+            &mut download_status,
+            &mut download_rx,
+            &mut worker_cancel,
+            &mut progress,
+            &mut progress_synced,
+            &mut last_tick,
+            tick_rate,
+            &mut download_error,
+            &mut eta_text,
+            &mut split_progress,
+            &mut split_note,
+            &mut trans_progress,
+            &mut trans_note,
+            &mut minutes_progress,
+            &mut minutes_note,
+            &mut summary_progress,
+            &mut summary_note,
+            &mut debug_lines,
+            &mut tabs,
+            &mut selected_tab,
+            &mut transcript_text,
+            &mut minutes_text,
+            &mut summary_text,
+            &mut scroll_minutes,
+        );
 
         terminal.draw(|frame| {
             ui::render(
@@ -402,4 +225,228 @@ fn is_valid_url(value: &str) -> bool {
     }
     let lower = value.to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+fn handle_download_tick(
+    has_valid_link: bool,
+    download_url: &str,
+    output_target: &str,
+    download_status: &mut DownloadStatus,
+    download_rx: &mut Option<mpsc::Receiver<WorkerMessage>>,
+    worker_cancel: &mut Option<Arc<AtomicBool>>,
+    progress: &mut f64,
+    progress_synced: &mut bool,
+    last_tick: &mut Instant,
+    tick_rate: Duration,
+    download_error: &mut Option<String>,
+    eta_text: &mut Option<String>,
+    split_progress: &mut f64,
+    split_note: &mut Option<String>,
+    trans_progress: &mut f64,
+    trans_note: &mut Option<String>,
+    minutes_progress: &mut f64,
+    minutes_note: &mut Option<String>,
+    summary_progress: &mut f64,
+    summary_note: &mut Option<String>,
+    debug_lines: &mut Vec<String>,
+    tabs: &mut Vec<String>,
+    selected_tab: &mut usize,
+    transcript_text: &mut Option<String>,
+    minutes_text: &mut Option<String>,
+    summary_text: &mut Option<String>,
+    scroll_minutes: &mut u16,
+) {
+    // Early return to avoid deep indentation
+    if !has_valid_link {
+        return;
+    }
+
+    if matches!(*download_status, DownloadStatus::Idle) {
+        let (tx, rx) = mpsc::channel();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_for_thread = Arc::clone(&cancel_flag);
+
+        let download_link = download_url.to_string();
+        let output_target_clone = output_target.to_string();
+        thread::spawn(move || {
+            worker::download::download_worker(
+                download_link,
+                output_target_clone,
+                tx,
+                cancel_for_thread,
+            )
+        });
+
+        *download_rx = Some(rx);
+        *download_status = DownloadStatus::Running;
+        *progress = 0.0;
+        *progress_synced = false;
+        *last_tick = Instant::now();
+        *worker_cancel = Some(cancel_flag);
+        debug_lines.clear();
+        *eta_text = None;
+    }
+
+    if let Some(rx) = download_rx.take() {
+        let mut keep_rx = true;
+        let disconnected = loop {
+            match rx.try_recv() {
+                Ok(message) => match message {
+                    WorkerMessage::StageProgress { stage, ratio, eta, note } => match stage {
+                        Stage::Download => {
+                            *progress = ratio.clamp(0.0, 1.0);
+                            *progress_synced = true;
+                            *eta_text = eta;
+                        }
+                        Stage::Split => {
+                            *split_progress = ratio.clamp(0.0, 1.0);
+                            *split_note = note;
+                        }
+                        Stage::Transcribe => {
+                            *trans_progress = ratio.clamp(0.0, 1.0);
+                            *trans_note = note;
+                        }
+                        Stage::Minutes => {
+                            *minutes_progress = ratio.clamp(0.0, 1.0);
+                            *minutes_note = note;
+                        }
+                        Stage::Summary => {
+                            *summary_progress = ratio.clamp(0.0, 1.0);
+                            *summary_note = note;
+                        }
+                    },
+                    WorkerMessage::Status(result) => {
+                        *download_rx = None;
+                        *worker_cancel = None;
+                        match result {
+                            Ok(()) => {
+                                *progress = 1.0;
+                                *split_progress = 1.0;
+                                *trans_progress = 1.0;
+                                *download_status = DownloadStatus::Success;
+                                *download_error = None;
+                                *eta_text = None;
+                                if fs::metadata("transcript.txt").is_err() {
+                                    continue;
+                                }
+                                *transcript_text = fs::read_to_string("transcript.txt").ok();
+                                if !tabs.iter().any(|t| t == "Transcription") {
+                                    tabs.push("Transcription".to_string());
+                                }
+                                if !tabs.iter().any(|t| t == "Minutes") {
+                                    tabs.push("Minutes".to_string());
+                                }
+                                match worker::minutes::start_minutes_worker() {
+                                    Ok((mrx, cancel_new)) => {
+                                        *minutes_text = Some(String::new());
+                                        *download_rx = Some(mrx);
+                                        *worker_cancel = Some(cancel_new);
+                                        if let Some(idx) = tabs.iter().position(|t| t == "Minutes") {
+                                            *selected_tab = idx;
+                                        }
+                                        *scroll_minutes = 0;
+                                        keep_rx = false;
+                                        break false;
+                                    }
+                                    Err(msg) => {
+                                        *minutes_text = Some(msg);
+                                        if let Some(idx) = tabs.iter().position(|t| t == "Minutes") {
+                                            *selected_tab = idx;
+                                        }
+                                        *scroll_minutes = 0;
+                                        keep_rx = false;
+                                        break false;
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                *progress = 0.0;
+                                *split_progress = 0.0;
+                                *trans_progress = 0.0;
+                                *download_status = DownloadStatus::Failed;
+                                *download_error = Some(err);
+                                *eta_text = None;
+                            }
+                        }
+                    }
+                    WorkerMessage::MinutesChunk(chunk) => match minutes_text.as_mut() {
+                        Some(s) => s.push_str(&chunk),
+                        None => *minutes_text = Some(chunk),
+                    },
+                    WorkerMessage::MinutesDone(res) => {
+                        *download_rx = None;
+                        *worker_cancel = None;
+                        if res.is_ok() {
+                            if let Some(pos) = tabs.iter().position(|t| t == "Q/A") {
+                                tabs.remove(pos);
+                            }
+                            if let Some(pos) = tabs.iter().position(|t| t == "Summary") {
+                                tabs.remove(pos);
+                            }
+                            if let Some(min_idx) = tabs.iter().position(|t| t == "Minutes") {
+                                tabs.insert(min_idx + 1, "Summary".to_string());
+                            }
+                            match worker::summary::start_summary_worker() {
+                                Ok((srx, cancel_new)) => {
+                                    *summary_text = Some(String::new());
+                                    *download_rx = Some(srx);
+                                    *worker_cancel = Some(cancel_new);
+                                    keep_rx = false;
+                                    break false;
+                                }
+                                Err(msg) => {
+                                    *summary_text = Some(msg);
+                                }
+                            }
+                            tabs.push("Q/A".to_string());
+                            if let Some(qa_idx) = tabs.iter().position(|t| t == "Q/A") {
+                                *selected_tab = qa_idx;
+                            }
+                        } else {
+                            keep_rx = false;
+                            break false;
+                        }
+                    }
+                    WorkerMessage::DownloadLog(line) => {
+                        debug_lines.push(line);
+                        if debug_lines.len() > DEBUG_MAX_LINES {
+                            let overflow = debug_lines.len() - DEBUG_MAX_LINES;
+                            debug_lines.drain(0..overflow);
+                        }
+                    }
+                    WorkerMessage::SummaryChunk(chunk) => match summary_text.as_mut() {
+                        Some(s) => s.push_str(&chunk),
+                        None => *summary_text = Some(chunk),
+                    },
+                    WorkerMessage::SummaryDone(_res) => {
+                        *download_rx = None;
+                        *worker_cancel = None;
+                        keep_rx = false;
+                        break false;
+                    }
+                },
+                Err(TryRecvError::Empty) => break false,
+                Err(TryRecvError::Disconnected) => break true,
+            }
+        };
+
+        if keep_rx && !disconnected {
+            *download_rx = Some(rx);
+        }
+        if disconnected && matches!(*download_status, DownloadStatus::Running) {
+            *download_rx = None;
+            *worker_cancel = None;
+            *download_status = DownloadStatus::Failed;
+            *download_error = Some("downloader process disconnected".to_string());
+            *eta_text = None;
+        }
+    }
+
+    if matches!(*download_status, DownloadStatus::Running)
+        && !*progress_synced
+        && last_tick.elapsed() >= tick_rate
+    {
+        *progress = (*progress + 0.02) % 1.0;
+        *last_tick = Instant::now();
+    }
 }
