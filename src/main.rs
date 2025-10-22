@@ -12,12 +12,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+use clap::Parser;
 use crossterm::{
     event::{self, Event},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{Terminal, backend::{Backend, CrosstermBackend}};
+use ratatui::{
+    Terminal,
+    backend::{Backend, CrosstermBackend},
+};
 // use crate::worker::audio_split::probe_duration_seconds; // moved to worker::transcribe
 
 mod banner;
@@ -26,6 +30,16 @@ mod ui;
 mod worker;
 
 // Banner used within ui module
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    /// Media URL to process. Falls back to $CLIPBOARD_TEXT when omitted.
+    url: Option<String>,
+    /// Path passed to yt-dlp for the downloaded audio file (default: audio.m4a).
+    #[arg(long)]
+    output: Option<String>,
+}
 
 const GLYPH_HEIGHT: usize = 5;
 const DEBUG_MAX_LINES: usize = 200;
@@ -49,7 +63,12 @@ pub(crate) enum Stage {
 
 pub(crate) enum WorkerMessage {
     // Stage-aware progress for multi-phase pipeline
-    StageProgress { stage: Stage, ratio: f64, eta: Option<String>, note: Option<String> },
+    StageProgress {
+        stage: Stage,
+        ratio: f64,
+        eta: Option<String>,
+        note: Option<String>,
+    },
     Status(Result<(), String>),
     DownloadLog(String),
     MinutesChunk(String),
@@ -59,13 +78,18 @@ pub(crate) enum WorkerMessage {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let Cli { url, output } = Cli::parse();
+    let initial_input = url
+        .or_else(|| env::var("CLIPBOARD_TEXT").ok())
+        .unwrap_or_default();
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let app_result = run_app(&mut terminal);
+    let app_result = run_app(&mut terminal, initial_input, output);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -75,12 +99,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
-    let clipboard_text = env::var("CLIPBOARD_TEXT").unwrap_or_default();
-    let trimmed_clipboard = clipboard_text.trim().to_owned();
+fn run_app<B: Backend>(
+    terminal: &mut Terminal<B>,
+    initial_input: String,
+    output_override: Option<String>,
+) -> io::Result<()> {
+    let trimmed_clipboard = initial_input.trim().to_owned();
     let display_url = sanitize_clipboard(&trimmed_clipboard);
     let download_url = trimmed_clipboard.clone();
-    let output_target = worker::download::resolve_ytdlp_output();
+    let output_target = output_override
+        .and_then(|s| {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .unwrap_or_else(worker::download::resolve_ytdlp_output);
     let has_valid_link = is_valid_url(&download_url);
 
     let mut progress = 0.0_f64; // download progress
@@ -184,25 +220,27 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
             );
         })?;
 
-        if event::poll(Duration::from_millis(200))? && let Event::Key(key) = event::read()? {
-                let should_exit = keyboard::handle_key(
-                    &key,
-                    &tabs,
-                    &mut selected_tab,
-                    &mut scroll_logs,
-                    &mut scroll_trans,
-                    &mut scroll_minutes,
-                    logs_lines_count,
-                    trans_lines_count,
-                    minutes_lines_count,
-                    last_viewport_lines,
-                );
-                if should_exit {
-                    if let Some(cancel) = worker_cancel.take() {
-                        cancel.store(true, Ordering::SeqCst);
-                    }
-                    break;
+        if event::poll(Duration::from_millis(200))?
+            && let Event::Key(key) = event::read()?
+        {
+            let should_exit = keyboard::handle_key(
+                &key,
+                &tabs,
+                &mut selected_tab,
+                &mut scroll_logs,
+                &mut scroll_trans,
+                &mut scroll_minutes,
+                logs_lines_count,
+                trans_lines_count,
+                minutes_lines_count,
+                last_viewport_lines,
+            );
+            if should_exit {
+                if let Some(cancel) = worker_cancel.take() {
+                    cancel.store(true, Ordering::SeqCst);
                 }
+                break;
+            }
         }
     }
 
@@ -292,7 +330,12 @@ fn handle_download_tick(
         let disconnected = loop {
             match rx.try_recv() {
                 Ok(message) => match message {
-                    WorkerMessage::StageProgress { stage, ratio, eta, note } => match stage {
+                    WorkerMessage::StageProgress {
+                        stage,
+                        ratio,
+                        eta,
+                        note,
+                    } => match stage {
                         Stage::Download => {
                             *progress = ratio.clamp(0.0, 1.0);
                             *progress_synced = true;
@@ -341,7 +384,8 @@ fn handle_download_tick(
                                         *minutes_text = Some(String::new());
                                         *download_rx = Some(mrx);
                                         *worker_cancel = Some(cancel_new);
-                                        if let Some(idx) = tabs.iter().position(|t| t == "Minutes") {
+                                        if let Some(idx) = tabs.iter().position(|t| t == "Minutes")
+                                        {
                                             *selected_tab = idx;
                                         }
                                         *scroll_minutes = 0;
@@ -350,7 +394,8 @@ fn handle_download_tick(
                                     }
                                     Err(msg) => {
                                         *minutes_text = Some(msg);
-                                        if let Some(idx) = tabs.iter().position(|t| t == "Minutes") {
+                                        if let Some(idx) = tabs.iter().position(|t| t == "Minutes")
+                                        {
                                             *selected_tab = idx;
                                         }
                                         *scroll_minutes = 0;

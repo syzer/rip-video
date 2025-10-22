@@ -3,13 +3,43 @@
 This repository includes a TUI to download audio, split into parts, transcribe with ffmpeg-whisper, generate meeting minutes using a local Ollama model.
 ![rip-video](rip-video.png)
 
-How to use (macOS)
-- grab youtube link
-- In your browser DevTools (Network tab), copy the media URL that contains the string `videomanifest` to your clipboard.
-- If you haven't yet, create the local minutes model: `just create-minutes` (one-time).
-- Run `just` (shorthand for `CLIPBOARD_TEXT="$(pbpaste)" cargo run`).
-- The app will pick the URL from the clipboard, download audio, split, transcribe, and prepare Minutes.
-- To remove generated artifacts (audio, parts, transcript, minutes), run: `just reset`.
+## Install
+
+Once published you will be able to install the binary directly:
+
+```bash
+cargo install rip-video
+```
+
+Until then you can still install from the repository:
+
+```bash
+cargo install --path .
+# or
+cargo install --git https://github.com/syzer/rip-video
+```
+
+## Usage
+
+1. Grab the media link (e.g. open DevTools Network tab and copy the request URL that contains `videomanifest`).
+2. Launch the TUI with the URL:
+   ```bash
+   rip-video <MEDIA_URL>
+   # optionally override the output audio path (default: audio.m4a)
+   rip-video --output downloads/audio.m4a <MEDIA_URL>
+   ```
+3. The app downloads audio via `yt-dlp`, splits and transcribes it with `ffmpeg-whisper`, then generates Minutes and a Summary using local Ollama models.
+
+If you prefer to rely on the clipboard, set the `CLIPBOARD_TEXT` environment variable before launching:
+
+```bash
+CLIPBOARD_TEXT="$(pbpaste)" rip-video
+```
+
+macOS convenience targets are kept in the `justfile`:
+- `just` runs the command above.
+- `just create-minutes` creates the local minutes model (one-time).
+- `just reset` removes generated artifacts (audio, parts, transcript, minutes).
 
 
 
